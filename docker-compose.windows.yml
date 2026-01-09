@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  # SQLite database (file-based, no separate container needed)
+  # Database file will be created in ./backend/data/database.sqlite
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.windows
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=development
+      - DB_TYPE=sqlite
+      - DB_FILE=./data/database.sqlite
+      - PORT=3001
+      - JWT_SECRET=development-jwt-secret-change-in-production
+      - BACKUP_DIR=./backup
+    volumes:
+      - ./backend/data:/app/data
+      - ./backup:/app/backup
+      - ./logs:/app/logs
+    networks:
+      - gws-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.windows
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:3001/api
+    depends_on:
+      - backend
+    networks:
+      - gws-network
+
+networks:
+  gws-network:
+    driver: bridge
+
+volumes:
+  backup:
+  logs:
