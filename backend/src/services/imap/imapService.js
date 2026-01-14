@@ -1,4 +1,4 @@
-const Imap = require('imap');
+const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const fs = require('fs').promises;
 const path = require('path');
@@ -19,28 +19,30 @@ const logger = winston.createLogger({
   ],
 });
 
-// Rate limiter untuk Google Workspace compliance
+// Rate limiter untuk Google Workspace compliance - Sequential IMAP mode
+// Values can be overridden via environment variables with better defaults
 const RATE_LIMITS = {
-  MAX_CONCURRENT_CONNECTIONS: 15,
+  MAX_CONCURRENT_CONNECTIONS: parseInt(process.env.MAX_CONCURRENT_CONNECTIONS || '1'), // Sequential IMAP
   IDLE_REFRESH_INTERVAL: 25 * 60 * 1000,
-  BATCH_SIZE: 50,
-  FETCH_TIMEOUT: 60000,
+  BATCH_SIZE: parseInt(process.env.BATCH_SIZE || '100'), // Increased for faster processing
+  FETCH_TIMEOUT: parseInt(process.env.FETCH_TIMEOUT || '120000'), // 2 minutes for large batches
   RETRY_ATTEMPTS: 3,
-  RETRY_DELAY: 5000,
+  RETRY_DELAY: parseInt(process.env.RETRY_DELAY || '2000'), // Reduced delay
 };
 
 class ImapService {
   constructor() {
     this.connections = new Map();
     this.backupDir = process.env.BACKUP_DIR || './backup';
-    this.useRealGmail = process.env.USE_REAL_GMAIL === 'true';
     this.isProcessing = new Map();
     this.activeConnections = 0;
 
-    const mode = this.useRealGmail ? 'PRODUCTION (Real Gmail)' : 'DEVELOPMENT (Simulated)';
-    logger.info(`IMAP Service initialized in ${mode} mode`, {
+    // Always use real Gmail mode - no development mode
+    logger.info('IMAP Service initialized in PRODUCTION (Real Gmail) mode', {
       maxConcurrentConnections: RATE_LIMITS.MAX_CONCURRENT_CONNECTIONS,
       batchSize: RATE_LIMITS.BATCH_SIZE,
+      fetchTimeout: RATE_LIMITS.FETCH_TIMEOUT,
+      retryDelay: RATE_LIMITS.RETRY_DELAY,
     });
   }
 
@@ -67,102 +69,62 @@ class ImapService {
   }
 
   async connect(userEmail, userId) {
-    if (this.useRealGmail) {
-      return this.connectRealGmail(userEmail, userId);
-    } else {
-      return this.connectSimulated(userEmail, userId);
-    }
+    // Always use real Gmail mode - no simulated mode
+    return this.connectRealGmail(userEmail, userId);
   }
 
   async connectRealGmail(userEmail, userId) {
-    await this.acquireConnectionSlot();
-
+    let slotAcquired = false;
     try {
-      const { token } = await oauth2Service.generateXOAuth2Token(userEmail);
+      await this.acquireConnectionSlot();
+      slotAcquired = true;
+
+      let tokenData = await oauth2Service.generateXOAuth2Token(userEmail);
 
       const imapConfig = {
-        user: userEmail,
-        xoauth2: token,
         host: 'imap.gmail.com',
         port: 993,
-        tls: true,
-        tlsOptions: { rejectUnauthorized: false },
-        authTimeout: 30000,
-        connTimeout: 30000,
-        mailbox: 'INBOX',
+        secure: true,
+        saslMechanism: 'XOAUTH2',
+        auth: {
+          user: userEmail,
+          accessToken: tokenData.token
+        }
       };
 
-      const imap = new Imap(imapConfig);
+      const imap = new ImapFlow(imapConfig);
       const connectionId = uuidv4();
 
-      return new Promise((resolve, reject) => {
-        let connected = false;
-
-        const cleanup = () => {
-          if (!connected) this.releaseConnectionSlot();
-        };
-
-        imap.once('ready', async () => {
-          connected = true;
-          logger.info('IMAP connection ready (REAL GMAIL)', { userEmail, connectionId });
-
-          this.connections.set(userId, {
-            imap,
-            connectionId,
-            userEmail,
-            userId,
-            connectedAt: new Date(),
-            simulated: false,
-            lastActivity: Date.now(),
-          });
-
-          await this.updateConnectionStatus(userId, connectionId, 'connected');
-          resolve({ imap, connectionId, simulated: false });
-        });
-
-        imap.once('error', (err) => {
-          cleanup();
-          logger.error('IMAP connection error (REAL GMAIL)', { userEmail, connectionId, error: err.message });
-          reject(err);
-        });
-
-        imap.once('end', () => {
-          cleanup();
-          logger.info('IMAP connection ended (REAL GMAIL)', { userEmail, connectionId });
-          this.connections.delete(userId);
-          this.updateConnectionStatus(userId, connectionId, 'disconnected');
-        });
-
-        imap.connect();
+      // Error handler internal imapflow
+      imap.on('error', (err) => {
+        logger.error('IMAP Internal Error', { userEmail, msg: err.message });
       });
-    } catch (error) {
-      this.releaseConnectionSlot();
-      logger.error('Failed to connect to REAL IMAP', { userEmail, error: error.message });
-      throw error;
-    }
-  }
 
-  async connectSimulated(userEmail, userId) {
-    try {
-      const connectionId = uuidv4();
-      logger.info('IMAP connection simulated (development mode)', { userEmail, connectionId });
+      await imap.connect();
 
       this.connections.set(userId, {
-        imap: null,
+        imap,
         connectionId,
         userEmail,
         userId,
         connectedAt: new Date(),
-        simulated: true,
+        simulated: false,
       });
 
       await this.updateConnectionStatus(userId, connectionId, 'connected');
-      return { imap: null, connectionId, simulated: true };
+      return { imap, connectionId };
+
     } catch (error) {
-      logger.error('Failed to establish simulated IMAP connection', { userEmail, error: error.message });
+      // CRITICAL: Jika slot sudah diambil tapi koneksi gagal, lepas slotnya!
+      if (slotAcquired) {
+        this.releaseConnectionSlot();
+      }
+      logger.error('Failed to connect IMAP', { userEmail, error: error.message });
       throw error;
     }
   }
+
+
 
   async startIdle(userId) {
     try {
@@ -171,30 +133,14 @@ class ImapService {
         throw new Error('No active IMAP connection for user');
       }
 
-      const { userEmail, simulated } = connection;
+      const { userEmail } = connection;
 
-      if (simulated) {
-        return this.startSimulatedIdle(userId, connection);
-      } else {
-        return this.startRealIdle(userId, connection);
-      }
+      // Always use real IDLE mode - no simulated mode
+      return this.startRealIdle(userId, connection);
     } catch (error) {
       logger.error('Failed to start IDLE', { userId, error: error.message });
       throw error;
     }
-  }
-
-  async startSimulatedIdle(userId, connection) {
-    const { userEmail } = connection;
-    logger.info('Starting simulated IDLE mode', { userEmail });
-
-    await this.updateConnectionStatus(userId, connection.connectionId, 'idle');
-
-    connection.idleInterval = setInterval(async () => {
-      logger.debug('Simulated IDLE heartbeat', { userEmail });
-    }, 60000);
-
-    return { simulated: true };
   }
 
   async startRealIdle(userId, connection) {
@@ -279,27 +225,26 @@ class ImapService {
   }
 
   async listFolders(imap) {
-    return new Promise((resolve, reject) => {
-      imap.getBoxes((err, boxes) => {
-        if (err) reject(err);
-        else {
-          // Get all folder names including sub-folders
-          const folders = this.extractFolderNames(boxes);
-          resolve(folders);
-        }
-      });
-    });
+    try {
+      // IMAPFLOW: Use mailbox listing
+      const mailboxes = await imap.list();
+      const folders = mailboxes.map(mailbox => mailbox.path);
+      return folders;
+    } catch (error) {
+      logger.error('Failed to list folders', { error: error.message });
+      throw error;
+    }
   }
 
   extractFolderNames(boxes, prefix = '') {
     let folders = [];
     for (const [name, box] of Object.entries(boxes)) {
-      const fullPath = prefix ? `${prefix}${name}` : name;
+      const fullPath = prefix ? `${prefix}/${name}` : name; // Use '/' separator instead of concatenation
       // Add main folder
       folders.push(fullPath);
       // Recursively get sub-folders
       if (box.children) {
-        folders = folders.concat(this.extractFolderNames(box.children, `${fullPath}`));
+        folders = folders.concat(this.extractFolderNames(box.children, fullPath));
       }
     }
     return folders;
@@ -354,8 +299,8 @@ class ImapService {
       await query(
         `INSERT INTO email_folder_uids (user_id, folder_name, last_uid, updated_at)
          VALUES (?, ?, ?, NOW())
-         ON CONFLICT(user_id, folder_name) DO UPDATE SET
-         last_uid = excluded.last_uid,
+         ON DUPLICATE KEY UPDATE
+         last_uid = VALUES(last_uid),
          updated_at = NOW()`,
         [userId, folder, uid]
       );
@@ -365,65 +310,89 @@ class ImapService {
   }
 
   async processMessageBatch(imap, uids, userId, userEmail, folder = 'INBOX') {
-    const promises = uids.map(uid =>
-      this.fetchAndStoreMessage(imap, uid, userId, userEmail, folder)
-        .catch(err => {
-          logger.error('Failed to process message', { uid, userEmail, folder, error: err.message });
-          return null;
-        })
-    );
+    logger.info('Starting batch processing', { userEmail, folder, batchSize: uids.length });
 
-    const results = await Promise.all(promises);
-    const successCount = results.filter(r => r !== null).length;
-    logger.info('Batch processed', { userEmail, folder, total: uids.length, success: successCount });
+    let successCount = 0;
+    let errorCount = 0;
+
+    // Proses satu per satu, jangan pakai Promise.all agar tidak OOM (Out of Memory)
+    for (const [index, uid] of uids.entries()) {
+      try {
+        if (!imap || imap.state !== 'authenticated') {
+          logger.error('IMAP connection lost during batch', { uid, userEmail });
+          break;
+        }
+
+        // Gunakan info agar muncul di console
+        logger.info(`Processing ${index + 1}/${uids.length}`, { uid, userEmail });
+
+        const result = await this.fetchAndStoreMessage(imap, uid, userId, userEmail, folder);
+
+        if (result) {
+          successCount++;
+        }
+      } catch (err) {
+        errorCount++;
+        logger.error('Failed to process message', { uid, error: err.message });
+      }
+    }
+
+    logger.info('Batch processing completed', {
+      folder,
+      success: successCount,
+      errors: errorCount
+    });
   }
 
   async fetchAndStoreMessage(imap, uid, userId, userEmail, folder = 'INBOX') {
     try {
-      const messages = await this.fetchMessages(imap, uid, { bodies: '' });
-      if (!messages || messages.length === 0) return null;
-
-      const message = messages[0];
-      const parsed = await simpleParser(message.body);
-
-      // Deduplication - skip if already exists
-      if (parsed.messageId) {
-        const existing = await query(
-          'SELECT id FROM emails WHERE message_id = ? AND user_id = ?',
-          [parsed.messageId, userId]
-        );
-
-        if (existing.length > 0) {
-          logger.debug('Message already exists, skipping', { messageId: parsed.messageId, userEmail, folder });
-          await this.updateLastUidByFolder(userId, folder, uid);
-          return null;
-        }
-      }
-
-      // Store EML file
-      const emlPath = await this.storeEmlFile(message.body, userEmail, parsed.date, folder);
-
-      // CRITICAL: Store email metadata with folder
-      const emailId = await this.storeEmailMetadata(userId, parsed, emlPath, message.body.length, folder);
-
-      // Store attachments
-      if (parsed.attachments && parsed.attachments.length > 0) {
-        await this.storeAttachments(emailId, parsed.attachments);
-      }
-
-      await this.updateLastUidByFolder(userId, folder, uid);
-
-      logger.info('Message stored successfully', {
-        userEmail,
-        folder,
-        messageId: parsed.messageId,
-        uid,
-        subject: parsed.subject?.substring(0, 50)
+      const messages = await this.fetchMessages(imap, uid.toString(), {
+        source: true,
+        envelope: true,
+        internalDate: true,
       });
 
-      return emailId;
+      if (!messages || messages.length === 0 || !messages[0].sourceBuffer) {
+        // Jika email kosong/ghost, lompati
+        await this.updateLastUidByFolder(userId, folder, uid);
+        return null;
+      }
+
+      const message = messages[0];
+      const rawContent = message.sourceBuffer;
+      logger.info(`Parsing email UID ${uid}...`, { size: rawContent.length });
+
+      // 1. Parsing
+      const parsed = await simpleParser(rawContent);
+
+      // 2. Simpan File EML
+      const emlPath = await this.storeEmlFile(rawContent, userEmail, parsed.date || new Date(), folder);
+      logger.info(`EML Saved: ${emlPath}`);
+
+      // 3. Simpan ke Database
+      logger.info(`Inserting to DB UID ${uid}...`);
+      const emailId = await this.storeEmailMetadata(userId, parsed, emlPath, rawContent.length, folder);
+
+      if (emailId) {
+        if (parsed.attachments?.length > 0) {
+          await this.storeAttachments(emailId, parsed.attachments);
+        }
+
+        await this.updateLastUidByFolder(userId, folder, uid);
+
+        // LOG INFO AGAR TERLIHAT DI CONSOLE
+        logger.info(`✓ SUCCESS: UID ${uid} saved with ID ${emailId}`);
+        return emailId;
+      } else {
+        logger.warn(`! SKIPPED: UID ${uid} mungkin duplikat.`);
+        await this.updateLastUidByFolder(userId, folder, uid);
+      }
+
+      return null;
     } catch (error) {
-      logger.error('Failed to fetch and store message', { uid, userEmail, folder, error: error.message });
+      logger.error(`CRITICAL ERROR UID ${uid}:`, { msg: error.message });
+      // Tetap update UID agar tidak stuck di email yang rusak
+      await this.updateLastUidByFolder(userId, folder, uid);
       throw error;
     }
   }
@@ -454,28 +423,44 @@ class ImapService {
     try {
       const sanitizeText = (text) => {
         if (!text) return null;
-        return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '').substring(0, 2000);
+        // Menghapus emoji dan karakter 4-byte UTF-8 agar aman untuk utf8mb3
+        // Jika database belum diupgrade ke utf8mb4
+        return text
+          .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '') // Remove emoji/surrogate pairs
+          .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '') // Remove control chars
+          .substring(0, 500);
       };
 
-      const result = await query(
-        `INSERT INTO emails (user_id, message_id, subject, from_email, to_email, date, eml_path, size, folder, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-        [
-          userId,
-          parsedEmail.messageId,
-          sanitizeText(parsedEmail.subject),
-          sanitizeText(parsedEmail.from?.text),
-          sanitizeText(parsedEmail.to?.text),
-          parsedEmail.date,
-          emlPath,
-          size,
-          folder,
-        ]
-      );
+      const sql = `INSERT IGNORE INTO emails (user_id, message_id, subject, from_email, to_email, date, eml_path, size, folder, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`;
 
-      return result.insertId || result.rows?.[0]?.id;
+      const params = [
+        userId,
+        parsedEmail.messageId || uuidv4(),
+        sanitizeText(parsedEmail.subject),
+        sanitizeText(parsedEmail.from?.text),
+        sanitizeText(parsedEmail.to?.text),
+        parsedEmail.date || new Date(),
+        emlPath,
+        size,
+        folder
+      ];
+
+      const result = await query(sql, params);
+
+      // FIX UNTUK MYSQL2 PROMISE:
+      // result biasanya berbentuk [ResultSetHeader, Fields]
+      const header = Array.isArray(result) ? result[0] : result;
+
+      if (header && header.affectedRows === 0) {
+        logger.info('Duplicate email ignored', { messageId: parsedEmail.messageId });
+        return null;
+      }
+
+      const insertId = header.insertId || (header.rows && header.rows[0]?.id);
+      return insertId;
     } catch (error) {
-      logger.error('Failed to store email metadata', { userId, error: error.message });
+      logger.error('DB Metadata Error', { error: error.message });
       throw error;
     }
   }
@@ -551,9 +536,9 @@ class ImapService {
       await query(
         `INSERT INTO imap_connections (user_id, connection_id, status, last_activity)
          VALUES (?, ?, ?, NOW())
-         ON CONFLICT(user_id) DO UPDATE SET
-         connection_id = excluded.connection_id,
-         status = excluded.status,
+         ON DUPLICATE KEY UPDATE
+         connection_id = VALUES(connection_id),
+         status = VALUES(status),
          last_activity = NOW()`,
         [userId, connectionId, status]
       );
@@ -563,43 +548,97 @@ class ImapService {
   }
 
   async openMailbox(imap, mailboxName, readOnly = true) {
-    return new Promise((resolve, reject) => {
-      imap.openBox(mailboxName, readOnly, (err, box) => {
-        if (err) reject(err);
-        else resolve(box);
-      });
-    });
+    try {
+      // IMAPFLOW: Use mailboxOpen() API (not selectMailbox)
+      const mailbox = await imap.mailboxOpen(mailboxName, { readOnly });
+      logger.debug('Mailbox opened', { mailbox: mailboxName });
+      return mailbox;
+    } catch (error) {
+      logger.error('Failed to open mailbox', { mailbox: mailboxName, error: error.message });
+      throw error;
+    }
   }
 
   async searchMessages(imap, criteria) {
-    return new Promise((resolve, reject) => {
-      imap.search(criteria, (err, results) => {
-        if (err) reject(err);
-        else resolve(results);
+    try {
+      let searchCriteria;
+
+      // Jika criteria adalah UID range (seperti "92:*")
+      if (typeof criteria === 'string' || typeof criteria === 'number') {
+        searchCriteria = { uid: criteria };
+      } else if (Array.isArray(criteria) && criteria[0] && criteria[0][0] === 'UID') {
+        // Mengubah format [['UID', '92:*']] menjadi { uid: '92:*' }
+        searchCriteria = { uid: criteria[0][1] };
+      } else {
+        searchCriteria = { all: true };
+      }
+
+      logger.debug('IMAP search criteria conversion', {
+        originalCriteria: criteria,
+        convertedCriteria: searchCriteria
       });
-    });
+
+      const results = await imap.search(searchCriteria);
+      // imap.search mengembalikan array of UIDs di imapflow
+      return results;
+    } catch (error) {
+      logger.error('IMAP search failed', { criteria, error: error.message });
+      throw error;
+    }
   }
 
   async fetchMessages(imap, uids, options) {
-    return new Promise((resolve, reject) => {
+    try {
       const messages = [];
-      const fetch = imap.fetch(uids, options);
+      // ImapFlow fetch menggunakan async generator
+      for await (const message of imap.fetch(uids, options)) {
+        // Pastikan kita mengonsumsi stream source jika ada
+        if (message.source) {
+          // Mengubah stream menjadi Buffer agar aman di memori
+          message.sourceBuffer = await this.streamToBuffer(message.source);
+        }
+        messages.push(message);
+      }
+      return messages;
+    } catch (error) {
+      logger.error('IMAP fetch failed', { uids, error: error.message });
+      throw error;
+    }
+  }
 
-      fetch.on('message', (msg) => {
-        let buffer = '';
-        msg.on('body', (stream) => {
-          stream.on('data', (chunk) => { buffer += chunk.toString('utf8'); });
-        });
-        msg.once('end', () => { messages.push({ body: buffer }); });
-      });
+  // Helper untuk mengubah stream menjadi Buffer
+  async streamToBuffer(readable) {
+    try {
+      const chunks = [];
+      for await (const chunk of readable) {
+        // Perbaikan: Jika chunk adalah angka (byte), bungkus ke dalam Buffer
+        if (typeof chunk === 'number') {
+          chunks.push(Buffer.from([chunk]));
+        } else {
+          chunks.push(Buffer.from(chunk));
+        }
+      }
+      return Buffer.concat(chunks);
+    } catch (error) {
+      logger.error('Error converting stream to buffer', { error: error.message });
+      throw error;
+    }
+  }
 
-      fetch.once('end', () => resolve(messages));
-      fetch.once('error', (err) => reject(err));
+  async streamToString(stream) {
+    return new Promise((resolve, reject) => {
+      let data = '';
+      stream.on('data', chunk => data += chunk.toString('utf8'));
+      stream.on('end', () => resolve(data));
+      stream.on('error', reject);
     });
   }
 
   extractMessageId(emlContent) {
-    const lines = emlContent.split('\n');
+    // Jika emlContent adalah Buffer, ubah ke String
+    const content = Buffer.isBuffer(emlContent) ? emlContent.toString('utf8') : emlContent;
+
+    const lines = content.split('\n');
     for (const line of lines) {
       if (line.toLowerCase().startsWith('message-id:')) {
         return line.split(':')[1].trim().replace(/[<>]/g, '');
@@ -636,32 +675,311 @@ class ImapService {
 
   async disconnect(userId) {
     try {
+      logger.info('Starting IMAP disconnect process', { userId });
+
       const connection = this.connections.get(userId);
       if (connection) {
+        logger.info('Found active connection for disconnect', {
+          userId,
+          connectionId: connection.connectionId,
+          simulated: connection.simulated,
+          userEmail: connection.userEmail
+        });
+
         if (connection.imap && !connection.simulated) {
-          connection.imap.end();
+          logger.info('Logging out IMAPFLOW connection', { userId });
+          await connection.imap.logout();
         }
+
         if (connection.idleInterval) {
+          logger.info('Clearing idle interval', { userId });
           clearInterval(connection.idleInterval);
         }
         if (connection.reconnectTimeout) {
+          logger.info('Clearing reconnect timeout', { userId });
           clearTimeout(connection.reconnectTimeout);
         }
         if (connection.heartbeatInterval) {
+          logger.info('Clearing heartbeat interval', { userId });
           clearInterval(connection.heartbeatInterval);
         }
+
         this.connections.delete(userId);
         this.releaseConnectionSlot();
-        logger.info('IMAP disconnected', { userId, mode: connection.simulated ? 'simulated' : 'real' });
+
+        // Update connection status in database
+        await this.updateConnectionStatus(userId, connection.connectionId, 'disconnected');
+
+        logger.info('IMAP disconnected successfully', {
+          userId,
+          connectionId: connection.connectionId,
+          mode: connection.simulated ? 'simulated' : 'real',
+          userEmail: connection.userEmail
+        });
+      } else {
+        logger.warn('No active connection found for disconnect', { userId });
       }
     } catch (error) {
-      logger.error('Failed to disconnect IMAP', { userId, error: error.message });
+      logger.error('Failed to disconnect IMAP', { userId, error: error.message, stack: error.stack });
     }
   }
 
   async disconnectAll() {
     for (const [userId] of this.connections) {
       await this.disconnect(userId);
+    }
+  }
+
+  // Method for full mailbox backup (used by queue service)
+  async backupUserMailbox(userId, userEmail) {
+    try {
+      logger.info('Starting full mailbox backup (REAL GMAIL)', { userId, userEmail });
+
+      // Always use real Gmail mode - no simulated mode
+      await this.backupRealMailbox(userId, userEmail);
+
+      logger.info('Full mailbox backup completed (REAL GMAIL)', { userId, userEmail });
+    } catch (error) {
+      logger.error('Full mailbox backup failed (REAL GMAIL)', { userId, userEmail, error: error.message });
+      throw error;
+    }
+  }
+
+  async backupRealMailbox(userId, userEmail) {
+    try {
+      // Connect to IMAP
+      const { imap } = await this.connect(userEmail, userId);
+
+      // Get all folders
+      const allFolders = await this.listFolders(imap);
+      logger.info('Available folders', { userEmail, folderCount: allFolders.length, folders: allFolders });
+
+      // CRITICAL FIX: Prioritize Gmail system folders for backup stability
+      // Gmail labels can be problematic, so backup system folders first
+      const gmailSystemFolders = [
+        'INBOX',
+        '[Gmail]/All Mail',
+        '[Gmail]/Sent Mail',
+        '[Gmail]/Trash'
+      ];
+
+      // Separate system folders from user labels
+      const systemFolders = allFolders.filter(folder =>
+        gmailSystemFolders.some(sysFolder =>
+          folder.toLowerCase().includes(sysFolder.toLowerCase())
+        )
+      );
+
+      const labelFolders = allFolders.filter(folder =>
+        !gmailSystemFolders.some(sysFolder =>
+          folder.toLowerCase().includes(sysFolder.toLowerCase())
+        )
+      );
+
+      logger.info('Separated folders for backup', {
+        userEmail,
+        systemFolders: systemFolders.length,
+        labelFolders: labelFolders.length
+      });
+
+      // Process system folders first (more reliable)
+      for (const folder of systemFolders) {
+        try {
+          logger.info('Backing up Gmail system folder', { userEmail, folder });
+          await this.backupFolder(imap, folder, userId, userEmail);
+        } catch (folderError) {
+          logger.warn('Failed to backup system folder, continuing with others', {
+            userEmail, folder, error: folderError.message
+          });
+          // Continue with next folder, don't fail the entire backup
+        }
+      }
+
+      // Process user label folders (may be less reliable)
+      for (const folder of labelFolders) {
+        try {
+          logger.info('Backing up Gmail label folder', { userEmail, folder });
+          await this.backupFolder(imap, folder, userId, userEmail);
+        } catch (folderError) {
+          logger.warn('Failed to backup label folder, continuing with others', {
+            userEmail, folder, error: folderError.message
+          });
+          // Continue with next folder, don't fail the entire backup
+        }
+      }
+
+      // Disconnect after backup
+      await this.disconnect(userId);
+      logger.info('Gmail mailbox backup completed successfully', { userEmail, totalFolders: allFolders.length });
+
+    } catch (error) {
+      logger.error('Real mailbox backup failed', { userId, userEmail, error: error.message });
+      // Make sure to disconnect even on error
+      try {
+        await this.disconnect(userId);
+      } catch (disconnectError) {
+        logger.warn('Failed to disconnect after backup error', { userId, error: disconnectError.message });
+      }
+      throw error;
+    }
+  }
+
+
+
+  async backupFolder(imap, folder, userId, userEmail) {
+    try {
+      logger.info('Backing up folder', { userEmail, folder });
+
+      // Get fresh token for this operation
+      const tokenData = await oauth2Service.generateXOAuth2Token(userEmail);
+
+      // Open the folder
+      await this.openMailbox(imap, folder, true); // Read-only for backup
+
+      // CRITICAL FIX: For Gmail, search ALL messages first to get actual UIDs
+      // Gmail IMAP doesn't guarantee sequential UIDs starting from 1
+      let results;
+      try {
+        const searchCriteria = ['ALL'];
+        results = await this.searchMessages(imap, searchCriteria);
+        logger.info('IMAP search completed', { userEmail, folder, uidCount: results.length });
+      } catch (searchError) {
+        logger.error('IMAP search failed', { userEmail, folder, error: searchError.message });
+        throw searchError;
+      }
+
+      if (results.length === 0) {
+        logger.debug('No messages in folder', { userEmail, folder });
+        return;
+      }
+
+      logger.info('Found messages in folder for backup', { userEmail, folder, count: results.length });
+
+      // CRITICAL FIX: ImapFlow search() returns Set<number>, convert to Array first
+      const uids = Array.from(results);
+
+      logger.info('Starting Gmail-compatible sequential processing', {
+        userEmail,
+        folder,
+        totalMessages: uids.length
+      });
+
+      // DEBUG: Log sample UIDs to verify they're not sequential
+      logger.info('Gmail UID sample (first 10)', {
+        userEmail,
+        folder,
+        uidSample: uids.slice(0, 10)
+      });
+
+      let processedCount = 0;
+      let successCount = 0;
+      let errorCount = 0;
+
+      // CRITICAL FIX: Process in small batches (50-200) for Gmail IMAP performance
+      // But still individual message processing to avoid parsing issues
+      const batchSize = 50; // Optimal for Gmail IMAP
+
+      for (let batchIndex = 0; batchIndex < uids.length; batchIndex += batchSize) {
+        const batch = uids.slice(batchIndex, batchIndex + batchSize);
+
+        logger.info('Processing Gmail UID batch', {
+          userEmail,
+          folder,
+          batchStart: batchIndex + 1,
+          batchEnd: Math.min(batchIndex + batchSize, uids.length),
+          batchSize: batch.length,
+          totalProcessed: processedCount,
+          totalMessages: uids.length
+        });
+
+        // Process each UID in batch individually
+        for (let i = 0; i < batch.length; i++) {
+          const uid = batch[i];
+          const globalIndex = batchIndex + i;
+
+          try {
+            logger.debug(`Processing message ${globalIndex + 1}/${uids.length}`, {
+              uid,
+              userEmail,
+              folder
+            });
+
+            // TEMPORARILY DISABLE STATE CHECKING - Let Gmail IMAP work with whatever state it has
+            // After mailboxOpen(), Gmail may be in state 3 which should still allow fetch operations
+            logger.debug('IMAP state check (DISABLED)', {
+              uid,
+              userEmail,
+              folder,
+              currentState: imap?.state,
+              stateType: typeof imap?.state,
+              note: 'State checking temporarily disabled to test Gmail fetch'
+            });
+
+            // Skip state validation for now - Gmail IMAP may work with state 3
+            // If fetch fails due to authentication, then create new connection
+
+            // Process single message
+            const result = await this.fetchAndStoreMessage(imap, uid, userId, userEmail, folder);
+
+            if (result !== null) {
+              successCount++;
+              logger.debug('Message processed successfully', { uid, userEmail, folder, emailId: result });
+            } else {
+              logger.debug('Message skipped (duplicate)', { uid, userEmail, folder });
+            }
+
+            processedCount++;
+
+          } catch (messageError) {
+            errorCount++;
+            logger.error('Failed to process individual message', {
+              uid,
+              userEmail,
+              folder,
+              index: globalIndex,
+              error: messageError.message,
+              errorType: messageError.constructor.name
+            });
+          }
+
+          // CRITICAL FIX: Delay between individual messages for Gmail stability
+          if (globalIndex < uids.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 300)); // 300ms delay for Gmail
+          }
+        }
+
+        // Log progress after each batch
+        logger.info('Gmail batch processing completed', {
+          userEmail,
+          folder,
+          batchProcessed: Math.min(batchIndex + batchSize, uids.length),
+          totalMessages: uids.length,
+          success: successCount,
+          errors: errorCount,
+          successRate: `${Math.round(successCount/Math.max(processedCount, 1)*100)}%`
+        });
+
+        // Delay between batches for Gmail rate limiting
+        if (batchIndex + batchSize < uids.length) {
+          logger.debug('Delaying before next Gmail batch', { userEmail, folder, delayMs: 1000 });
+          await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second between batches
+        }
+      }
+
+      logger.info('Gmail folder processing completed', {
+        userEmail,
+        folder,
+        totalMessages: results.length,
+        success: successCount,
+        errors: errorCount,
+        successRate: `${Math.round(successCount/results.length*100)}%`
+      });
+
+      logger.info('Folder backup completed', { userEmail, folder, totalMessages: results.length });
+
+    } catch (error) {
+      logger.error('Folder backup failed', { userEmail, folder, error: error.message });
+      throw error;
     }
   }
 }

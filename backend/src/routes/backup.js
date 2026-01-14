@@ -26,8 +26,8 @@ debugRouter.get('/config-debug', async (req, res) => {
     console.log('🔍 Debug: Backup config requested (no auth)');
     const config = {
       backupInterval: process.env.BACKUP_INTERVAL || '60',
-      maxConcurrentUsers: process.env.MAX_CONCURRENT_USERS || '3',
-      batchSize: process.env.BATCH_SIZE || '5',
+      maxConcurrentUsers: process.env.MAX_CONCURRENT_USERS || '1', // Sequential mode
+      batchSize: process.env.BATCH_SIZE || '100',                 // Faster processing
       batchDelay: process.env.BATCH_DELAY || '2000',
       useRealGmail: process.env.USE_REAL_GMAIL === 'true'
     };
@@ -46,8 +46,8 @@ router.get('/config', async (req, res) => {
     console.log('🔍 Backup config requested by:', req.user?.username || 'unknown');
     const config = {
       backupInterval: process.env.BACKUP_INTERVAL || '60',
-      maxConcurrentUsers: process.env.MAX_CONCURRENT_USERS || '3',
-      batchSize: process.env.BATCH_SIZE || '5',
+      maxConcurrentUsers: process.env.MAX_CONCURRENT_USERS || '1', // Sequential mode
+      batchSize: process.env.BATCH_SIZE || '100',                 // Faster processing
       batchDelay: process.env.BATCH_DELAY || '2000',
       useRealGmail: process.env.USE_REAL_GMAIL === 'true'
     };
@@ -66,8 +66,8 @@ router.get('/config-debug', async (req, res) => {
     console.log('🔍 Debug: Backup config requested (no auth)');
     const config = {
       backupInterval: process.env.BACKUP_INTERVAL || '60',
-      maxConcurrentUsers: process.env.MAX_CONCURRENT_USERS || '3',
-      batchSize: process.env.BATCH_SIZE || '5',
+      maxConcurrentUsers: process.env.MAX_CONCURRENT_USERS || '1', // Sequential mode
+      batchSize: process.env.BATCH_SIZE || '100',                 // Faster processing
       batchDelay: process.env.BATCH_DELAY || '2000',
       useRealGmail: process.env.USE_REAL_GMAIL === 'true'
     };

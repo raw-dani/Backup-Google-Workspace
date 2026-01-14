@@ -27,7 +27,7 @@ import api from '../services/api';
 const BackupSettings = () => {
   const [config, setConfig] = useState({
     backupInterval: '60',
-    maxConcurrentUsers: '3',
+    maxConcurrentUsers: '1',
     batchSize: '5',
     batchDelay: '2000',
     useRealGmail: false
@@ -162,13 +162,16 @@ const BackupSettings = () => {
                     onChange={handleChange('maxConcurrentUsers')}
                     label="Max Concurrent Users"
                   >
-                    <MenuItem value="1">1 User</MenuItem>
-                    <MenuItem value="2">2 Users</MenuItem>
-                    <MenuItem value="3">3 Users</MenuItem>
-                    <MenuItem value="5">5 Users</MenuItem>
-                    <MenuItem value="10">10 Users</MenuItem>
+                    <MenuItem value="1">1 User (Sequential)</MenuItem>
+                    <MenuItem value="2" disabled>2 Users (Disabled - Sequential Mode)</MenuItem>
+                    <MenuItem value="3" disabled>3 Users (Disabled - Sequential Mode)</MenuItem>
+                    <MenuItem value="5" disabled>5 Users (Disabled - Sequential Mode)</MenuItem>
+                    <MenuItem value="10" disabled>10 Users (Disabled - Sequential Mode)</MenuItem>
                   </Select>
                 </FormControl>
+                <Typography variant="caption" color="textSecondary" sx={{ mt: 0.5, display: 'block' }}>
+                  Sequential IMAP mode: Users are processed one by one to ensure service account compatibility
+                </Typography>
               </Grid>
 
               <Grid item xs={12} sm={6}>
@@ -275,7 +278,7 @@ const BackupSettings = () => {
               Manual Backup
             </Typography>
             <Typography variant="body2" color="textSecondary" paragraph>
-              Start a manual backup for all connected email accounts. This will run in the background.
+              Start a manual backup for all connected email accounts. This will run in sequential mode (one user at a time) in the background to ensure service account compatibility.
             </Typography>
             <Button
               variant="contained"

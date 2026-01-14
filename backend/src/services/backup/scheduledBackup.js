@@ -18,15 +18,15 @@ const logger = winston.createLogger({
 class ScheduledBackupService {
   constructor() {
     this.isRunning = false;
+    this.manualBackupRunning = false; // Flag to prevent concurrent manual backups
     this.cronJob = null;
-    this.useRealGmail = process.env.USE_REAL_GMAIL === 'true';
+    // Always use real Gmail mode - no development mode
     this.backupInterval = process.env.BACKUP_INTERVAL || '60'; // Default 60 minutes
-    this.maxConcurrentUsers = parseInt(process.env.MAX_CONCURRENT_USERS || '3'); // Default 3 concurrent users
-    this.batchSize = parseInt(process.env.BATCH_SIZE || '5'); // Default 5 messages per batch
+    this.maxConcurrentUsers = parseInt(process.env.MAX_CONCURRENT_USERS || '1'); // Default 1 for sequential mode
+    this.batchSize = parseInt(process.env.BATCH_SIZE || '100'); // Default 100 for faster processing
     this.batchDelay = parseInt(process.env.BATCH_DELAY || '2000'); // Default 2 seconds delay between batches
 
-    const mode = this.useRealGmail ? 'PRODUCTION (Real Gmail)' : 'DEVELOPMENT (Simulated)';
-    logger.info(`Scheduled Backup Service initialized in ${mode} mode`);
+    logger.info('Scheduled Backup Service initialized in PRODUCTION (Real Gmail) mode');
     logger.info(`Backup configuration: interval=${this.backupInterval}min, concurrent=${this.maxConcurrentUsers}, batch=${this.batchSize}, delay=${this.batchDelay}ms`);
   }
 
@@ -53,12 +53,11 @@ class ScheduledBackupService {
 
       try {
         this.isRunning = true;
-        const mode = this.useRealGmail ? 'REAL' : 'SIMULATED';
-        logger.info(`Starting scheduled backup (${mode})`);
+        logger.info('Starting scheduled backup (REAL)');
 
         await this.performBackup();
 
-        logger.info(`Scheduled backup (${mode}) completed successfully`);
+        logger.info('Scheduled backup (REAL) completed successfully');
       } catch (error) {
         logger.error('Scheduled backup failed', { error: error.message });
       } finally {
@@ -66,8 +65,7 @@ class ScheduledBackupService {
       }
     });
 
-    const mode = this.useRealGmail ? 'PRODUCTION (Real Gmail)' : 'DEVELOPMENT (Simulated)';
-    logger.info(`Scheduled backup service started (${mode} - runs every ${intervalMinutes} minutes)`);
+    logger.info(`Scheduled backup service started (PRODUCTION (Real Gmail) - runs every ${intervalMinutes} minutes)`);
   }
 
   async performBackup() {
@@ -78,8 +76,7 @@ class ScheduledBackupService {
         ['active']
       );
 
-      const mode = this.useRealGmail ? 'REAL' : 'SIMULATED';
-      logger.info(`Found users for ${mode} backup`, { count: users.length });
+      logger.info('Found users for REAL backup', { count: users.length });
 
       if (users.length === 0) {
         logger.info('No active users to backup');
@@ -93,31 +90,51 @@ class ScheduledBackupService {
         concurrentBatches.push(batch);
       }
 
-      for (const batch of concurrentBatches) {
-        logger.info(`Processing concurrent batch of ${batch.length} users`);
+      // Process users SEQUENTIALLY to avoid any potential credential conflicts
+      // Even though maxConcurrentUsers = 1, we want to ensure complete isolation
+      for (const user of users) {
+        try {
+          // Double-check user status before processing
+          const currentUser = await query(
+            'SELECT status FROM users WHERE id = ?',
+            [user.id]
+          );
 
-        // Process batch concurrently
-        const batchPromises = batch.map(user =>
-          this.backupUserMailbox(user.id, user.email).catch(error => {
-            logger.error(`Failed to backup user mailbox (${mode})`, {
+          if (currentUser.length === 0 || currentUser[0].status !== 'active') {
+            logger.info(`Skipping backup for inactive user`, {
               userId: user.id,
               email: user.email,
-              error: error.message
+              currentStatus: currentUser[0]?.status || 'not found'
             });
-            return null; // Don't fail the entire batch
-          })
-        );
+            continue;
+          }
 
-        await Promise.all(batchPromises);
+          logger.info('Starting sequential backup for user', {
+            userId: user.id,
+            email: user.email
+          });
 
-        // Add delay between concurrent batches to be respectful to Google
-        if (concurrentBatches.indexOf(batch) < concurrentBatches.length - 1) {
-          logger.info(`Waiting before processing next concurrent batch...`);
-          await new Promise(resolve => setTimeout(resolve, 5000)); // 5 second delay between batches
+          await this.backupUserMailbox(user.id, user.email);
+
+          logger.info('Backup completed for user', {
+            userId: user.id,
+            email: user.email
+          });
+
+          // Add delay between users to ensure complete cleanup and avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 3000)); // 3 second delay between users
+
+        } catch (error) {
+          logger.error('Failed to backup user mailbox (REAL)', {
+            userId: user.id,
+            email: user.email,
+            error: error.message
+          });
+          // Continue with next user even if one fails
         }
       }
 
-      logger.info(`All user backups completed (${mode})`);
+      logger.info('All user backups completed (REAL)');
     } catch (error) {
       logger.error('Failed to perform scheduled backup', { error: error.message });
       throw error;
@@ -125,123 +142,19 @@ class ScheduledBackupService {
   }
 
   async backupUserMailbox(userId, userEmail) {
-    if (this.useRealGmail) {
-      return this.backupRealMailbox(userId, userEmail);
-    } else {
-      return this.backupSimulatedMailbox(userId, userEmail);
-    }
-  }
-
-  async backupSimulatedMailbox(userId, userEmail) {
-    try {
-      logger.info('Starting SIMULATED mailbox backup', { userEmail });
-
-      // Simulate finding some messages
-      const simulatedMessageCount = Math.floor(Math.random() * 5) + 1; // 1-5 messages
-      logger.info('Simulated backup found messages', { userEmail, count: simulatedMessageCount });
-
-      // Create simulated email records in database
-      for (let i = 0; i < simulatedMessageCount; i++) {
-        const messageId = `simulated-${userId}-${Date.now()}-${i}`;
-        const subject = `Simulated Email ${i + 1}`;
-        const fromEmail = `sender${i + 1}@example.com`;
-        const toEmail = userEmail;
-        const emailDate = new Date(Date.now() - Math.random() * 7 * 24 * 60 * 60 * 1000); // Random date within last week
-
-        // Check if message already exists (simulate duplicate prevention)
-        const existing = await query('SELECT id FROM emails WHERE message_id = ?', [messageId]);
-        if (existing.length > 0) {
-          continue; // Skip duplicate
-        }
-
-        // Create simulated .eml file path
-        const year = emailDate.getFullYear();
-        const month = String(emailDate.getMonth() + 1).padStart(2, '0');
-        const domain = userEmail.split('@')[1];
-        const userPart = userEmail.split('@')[0];
-        const emlPath = `backup/${domain}/${userPart}/${year}/${month}/${messageId}.eml`;
-
-        // Insert email record
-        await query(
-          `INSERT INTO emails
-           (user_id, message_id, subject, from_email, to_email, date, eml_path, size)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [userId, messageId, subject, fromEmail, toEmail, emailDate, emlPath, Math.floor(Math.random() * 10000) + 1000]
-        );
-
-        // Update last UID to simulate progression
-        const currentUid = await imapService.getLastUid(userId);
-        await imapService.updateLastUid(userId, currentUid + 1);
-      }
-
-      // Simulate processing time
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-      logger.info('Simulated backup completed', { userEmail, processed: simulatedMessageCount });
-    } catch (error) {
-      logger.error('Failed to perform simulated mailbox backup', {
-        userId,
-        userEmail,
-        error: error.message
-      });
-      throw error;
-    }
+    // Always use real Gmail mode - no simulated mode
+    return this.backupRealMailbox(userId, userEmail);
   }
 
   async backupRealMailbox(userId, userEmail) {
     try {
       logger.info('Starting REAL mailbox backup', { userEmail });
 
-      // Connect to IMAP
-      const { imap } = await imapService.connect(userEmail, userId);
+      // Use the comprehensive backupFolder method from imapService
+      // This handles all folders, proper batching, and error handling
+      await imapService.backupUserMailbox(userId, userEmail);
 
-      try {
-        // Open INBOX
-        await imapService.openMailbox(imap, 'INBOX');
-
-        // Get last UID from database
-        const lastUid = await imapService.getLastUid(userId);
-
-        // Search for messages since last UID
-        const searchCriteria = lastUid > 0 ? [['UID', `${lastUid + 1}:*`]] : ['ALL'];
-        const results = await imapService.searchMessages(imap, searchCriteria);
-
-        if (results.length === 0) {
-          logger.info('No new messages to backup (REAL)', { userEmail });
-          return;
-        }
-
-        logger.info('Found messages to backup (REAL)', { userEmail, count: results.length });
-
-        // Process messages in small batches to avoid being flagged as suspicious
-        for (let i = 0; i < results.length; i += this.batchSize) {
-          const batch = results.slice(i, i + this.batchSize);
-          logger.info(`Processing batch ${Math.floor(i/this.batchSize) + 1} of ${Math.ceil(results.length/this.batchSize)} (${batch.length} messages)`);
-
-          // Process batch sequentially to be more respectful to Google
-          for (const uid of batch) {
-            try {
-              await imapService.fetchAndStoreMessage(imap, uid, userId, userEmail);
-              // Small delay between individual messages
-              await new Promise(resolve => setTimeout(resolve, 500));
-            } catch (error) {
-              logger.error('Failed to fetch message in batch', { uid, userEmail, error: error.message });
-            }
-          }
-
-          // Longer delay between batches to prevent rate limiting
-          if (i + this.batchSize < results.length) {
-            logger.info(`Waiting ${this.batchDelay}ms before next batch...`);
-            await new Promise(resolve => setTimeout(resolve, this.batchDelay));
-          }
-        }
-
-        logger.info('REAL mailbox backup completed', { userEmail, processed: results.length });
-
-      } finally {
-        // Close IMAP connection
-        imap.end();
-      }
+      logger.info('REAL mailbox backup completed', { userEmail });
 
     } catch (error) {
       logger.error('Failed to perform real mailbox backup', {
@@ -254,9 +167,16 @@ class ScheduledBackupService {
   }
 
   async manualBackup(userId = null) {
+    // Check if manual backup is already running to prevent concurrent backups
+    if (this.manualBackupRunning) {
+      const errorMsg = 'Manual backup already running. Please wait for the current backup to complete before starting a new one.';
+      logger.warn('Manual backup rejected - already running', { userId });
+      throw new Error(errorMsg);
+    }
+
     try {
-      const mode = this.useRealGmail ? 'REAL' : 'SIMULATED';
-      logger.info(`Starting manual backup (${mode})`, { userId });
+      this.manualBackupRunning = true;
+      logger.info('Starting manual backup (REAL)', { userId });
 
       if (userId) {
         // Backup specific user
@@ -271,10 +191,12 @@ class ScheduledBackupService {
         await this.performBackup();
       }
 
-      logger.info(`Manual backup (${mode}) completed successfully`);
+      logger.info('Manual backup (REAL) completed successfully');
     } catch (error) {
       logger.error('Manual backup failed', { error: error.message });
       throw error;
+    } finally {
+      this.manualBackupRunning = false;
     }
   }
 
@@ -288,6 +210,7 @@ class ScheduledBackupService {
   getStatus() {
     return {
       isRunning: this.isRunning,
+      manualBackupRunning: this.manualBackupRunning,
       nextRun: this.cronJob ? this.cronJob.nextRun : null,
     };
   }

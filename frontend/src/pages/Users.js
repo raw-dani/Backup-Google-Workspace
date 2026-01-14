@@ -317,11 +317,11 @@ Are you ABSOLUTELY sure you want to delete everything?`;
       return;
     }
 
-    const confirmMessage = `Start IMAP connections for ${eligibleUsers.length} selected user(s)?
+    const confirmMessage = `Start sequential IMAP connections for ${eligibleUsers.length} selected user(s)?
 
 ${eligibleUsers.map(u => `• ${u.email}`).join('\n')}
 
-This will initiate IMAP synchronization for these users.`;
+This will start IMAP synchronization for each user one by one, waiting for each to download 100 emails before moving to the next user. Users who are already fully synced will be skipped automatically. This ensures only one active IMAP connection at a time.`;
     if (!window.confirm(confirmMessage)) {
       return;
     }
@@ -334,17 +334,183 @@ This will initiate IMAP synchronization for these users.`;
       const results = [];
       let successCount = 0;
       let errorCount = 0;
+      let processedCount = 0;
+      let skippedCount = 0;
 
-      // Process users sequentially to avoid overwhelming the server
-      for (const user of eligibleUsers) {
+      // Function to check if user has emails to sync
+      const checkUserHasEmailsToSync = async (userId, userEmail) => {
         try {
+          const response = await usersAPI.getUserStats(userId);
+          const stats = response.data.stats || {};
+          const connection = response.data.connection;
+
+          const totalEmails = stats.total_emails || 0;
+
+          // If user has no emails at all, they definitely need syncing
+          if (totalEmails === 0) {
+            return true; // Has emails to sync
+          }
+
+          // If user has emails but connection indicates they've been fully synced
+          // Check if connection is idle and not recent (meaning sync completed some time ago)
+          if (connection && connection.status === 'idle' && connection.isRecent === false) {
+            // User appears to be fully synced - connection is idle and no recent activity
+            return false; // No emails to sync
+          }
+
+          // If user has significant number of emails (>1000) and connection shows completion
+          if (totalEmails > 1000 && connection && connection.status === 'idle') {
+            return false; // Likely fully synced
+          }
+
+          // If user has emails and last email date is old (>30 days) and connection is idle
+          if (stats.last_email_date && connection && connection.status === 'idle') {
+            const lastEmailDate = new Date(stats.last_email_date);
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+            if (lastEmailDate < thirtyDaysAgo) {
+              return false; // No recent emails and idle connection - likely fully synced
+            }
+          }
+
+          // Default: assume user needs syncing if we can't definitively determine they're fully synced
+          return true;
+
+        } catch (error) {
+          console.warn(`Could not check sync status for ${userEmail}:`, error);
+          return true; // Assume they need syncing if we can't check
+        }
+      };
+
+      // Function to check if user has reached 100 emails
+      const waitForEmailCount = async (userId, userEmail, initialCount) => {
+        const maxWaitTime = 5 * 60 * 1000; // 5 minutes timeout
+        const checkInterval = 5000; // Check every 5 seconds
+        const startTime = Date.now();
+
+        return new Promise((resolve, reject) => {
+          const checkEmailCount = async () => {
+            try {
+              const response = await usersAPI.getUserStats(userId);
+              const currentCount = response.data.stats?.total_emails || 0;
+              const connection = response.data.connection;
+
+              // Update results with current progress
+              setBulkImapResults(prev => {
+                if (!prev) return null;
+                const updatedResults = [...prev.results];
+                const userIndex = updatedResults.findIndex(r => r.user === userEmail);
+                if (userIndex !== -1) {
+                  const progress = currentCount - initialCount;
+                  updatedResults[userIndex] = {
+                    ...updatedResults[userIndex],
+                    message: `Downloading emails... (${progress >= 100 ? '100+' : progress}/100)`
+                  };
+                }
+                return { ...prev, results: updatedResults };
+              });
+
+              // Check if we've downloaded at least 100 emails since starting
+              if (currentCount - initialCount >= 100) {
+                resolve(currentCount);
+                return;
+              }
+
+              // Check if connection indicates completion (idle and no recent activity)
+              if (connection && connection.status === 'idle' && connection.isRecent === false) {
+                // User appears to be fully synced, resolve immediately
+                resolve(currentCount);
+                return;
+              }
+
+              if (Date.now() - startTime > maxWaitTime) {
+                reject(new Error('Timeout waiting for 100 emails'));
+                return;
+              }
+
+              setTimeout(checkEmailCount, checkInterval);
+            } catch (error) {
+              reject(error);
+            }
+          };
+
+          checkEmailCount();
+        });
+      };
+
+      // Process users sequentially - one at a time
+      for (let i = 0; i < eligibleUsers.length; i++) {
+        const user = eligibleUsers[i];
+        const isLastUser = i === eligibleUsers.length - 1;
+
+        try {
+          // Check if user has emails to sync before starting IMAP
+          const hasEmailsToSync = await checkUserHasEmailsToSync(user.id, user.email);
+
+          if (!hasEmailsToSync) {
+            results.push({
+              user: user.email,
+              status: 'skipped',
+              message: 'Already fully synced - no emails to download'
+            });
+            skippedCount++;
+            processedCount++;
+            continue; // Skip this user
+          }
+
+          // Get initial email count before starting IMAP
+          let initialCount = 0;
+          try {
+            const initialStats = await usersAPI.getUserStats(user.id);
+            initialCount = initialStats.data.stats?.total_emails || 0;
+          } catch (error) {
+            console.warn(`Could not get initial count for ${user.email}:`, error);
+          }
+
+          // Start IMAP connection for current user
           await usersAPI.connectUser(user.id);
+
           results.push({
             user: user.email,
-            status: 'success',
-            message: 'IMAP connection started'
+            status: 'in_progress',
+            message: 'IMAP connection started - waiting for 100 emails...'
           });
+
+          // Update results immediately
+          setBulkImapResults({
+            total: eligibleUsers.length,
+            success: successCount,
+            error: errorCount,
+            skipped: skippedCount,
+            results: results,
+            currentUser: user.email,
+            processed: processedCount
+          });
+
+          // Wait for user to download 100 emails (unless it's the last user)
+          if (!isLastUser) {
+            try {
+              await waitForEmailCount(user.id, user.email, initialCount);
+            } catch (waitError) {
+              console.warn(`Timeout or error waiting for ${user.email} to download 100 emails:`, waitError);
+              // Continue to next user even if timeout occurs
+            }
+          }
+
+          // Mark as success
+          const resultIndex = results.findIndex(r => r.user === user.email);
+          if (resultIndex !== -1) {
+            results[resultIndex] = {
+              ...results[resultIndex],
+              status: 'success',
+              message: 'IMAP connection started and monitored'
+            };
+          }
+
           successCount++;
+          processedCount++;
+
         } catch (error) {
           console.error(`Failed to start IMAP for ${user.email}:`, error);
           results.push({
@@ -353,14 +519,29 @@ This will initiate IMAP synchronization for these users.`;
             message: error.response?.data?.error || error.message
           });
           errorCount++;
+          processedCount++;
         }
+
+        // Update progress after each user
+        setBulkImapResults({
+          total: eligibleUsers.length,
+          success: successCount,
+          error: errorCount,
+          skipped: skippedCount,
+          results: results,
+          currentUser: isLastUser ? null : eligibleUsers[i + 1]?.email || null,
+          processed: processedCount
+        });
       }
 
+      // Final results
       setBulkImapResults({
         total: eligibleUsers.length,
         success: successCount,
         error: errorCount,
-        results: results
+        skipped: skippedCount,
+        results: results,
+        completed: true
       });
 
       // Clear selection and refresh
@@ -368,13 +549,19 @@ This will initiate IMAP synchronization for these users.`;
       await loadUsers();
 
       // Show summary alert
-      if (errorCount === 0) {
-        alert(`✅ Successfully started IMAP connections for all ${successCount} users!`);
-      } else if (successCount === 0) {
-        alert(`❌ Failed to start IMAP connections for all ${errorCount} users.`);
-      } else {
-        alert(`⚠️ Partial success: ${successCount} succeeded, ${errorCount} failed.`);
+      const summaryMessage = [];
+
+      if (successCount > 0) {
+        summaryMessage.push(`✅ ${successCount} users started IMAP successfully`);
       }
+      if (skippedCount > 0) {
+        summaryMessage.push(`⏭️ ${skippedCount} users skipped (already synced)`);
+      }
+      if (errorCount > 0) {
+        summaryMessage.push(`❌ ${errorCount} users failed`);
+      }
+
+      alert(`Sequential IMAP processing completed!\n\n${summaryMessage.join('\n')}\n\nEach user was processed one by one, waiting for 100 emails before moving to the next.`);
 
     } catch (error) {
       console.error('Bulk IMAP start failed:', error);
@@ -898,7 +1085,7 @@ Are you ABSOLUTELY sure you want to proceed?`;
                     Page {pagination.page} of {pagination.pages}
                   </Typography>
                   {selectedUsers.length > 0 && (
-                    <Box display="flex" gap={1}>
+                    <Box display="flex" gap={1} sx={{ flexWrap: 'wrap' }}>
                       <Button
                         variant="contained"
                         color="success"
@@ -906,8 +1093,9 @@ Are you ABSOLUTELY sure you want to proceed?`;
                         onClick={handleBulkImapStart}
                         disabled={bulkImapLoading}
                         size="small"
+                        sx={{ minWidth: '180px' }}
                       >
-                        {bulkImapLoading ? 'Starting...' : `Start IMAP (${selectedUsers.length})`}
+                        {bulkImapLoading ? (bulkImapResults?.currentUser ? `Processing: ${bulkImapResults.currentUser}` : 'Starting...') : `Start Sequential IMAP (${selectedUsers.length})`}
                       </Button>
                       <Button
                         variant="outlined"
@@ -930,6 +1118,12 @@ Are you ABSOLUTELY sure you want to proceed?`;
                         {bulkDeleteLoading ? 'Deleting...' : `Delete Users (${selectedUsers.length})`}
                       </Button>
                     </Box>
+                  )}
+
+                  {selectedUsers.length === 0 && (
+                    <Typography variant="body2" color="text.secondary" sx={{ fontStyle: 'italic' }}>
+                      Select users above to access bulk operations
+                    </Typography>
                   )}
                 </Box>
               </Box>
@@ -1076,6 +1270,13 @@ Are you ABSOLUTELY sure you want to proceed?`;
                   color="success"
                   size="small"
                 />
+                {bulkImapResults.skipped > 0 && (
+                  <Chip
+                    label={`Skipped: ${bulkImapResults.skipped}`}
+                    color="info"
+                    size="small"
+                  />
+                )}
                 {bulkImapResults.error > 0 && (
                   <Chip
                     icon={<Error />}
@@ -1092,23 +1293,39 @@ Are you ABSOLUTELY sure you want to proceed?`;
                   <Typography variant="h6" gutterBottom>
                     Operation Details
                   </Typography>
-                  {bulkImapResults.results.map((result, index) => (
-                    <Box key={index} sx={{ mb: 1, p: 1, borderRadius: 1, bgcolor: result.status === 'success' ? '#e8f5e8' : '#ffebee' }}>
-                      <Box display="flex" alignItems="center" gap={1}>
-                        {result.status === 'success' ? (
-                          <CheckCircle color="success" fontSize="small" />
-                        ) : (
-                          <Error color="error" fontSize="small" />
-                        )}
-                        <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
-                          {result.user}
+                  {bulkImapResults.results.map((result, index) => {
+                    const getBgColor = (status) => {
+                      switch (status) {
+                        case 'success': return '#e8f5e8';
+                        case 'skipped': return '#e3f2fd';
+                        case 'error': return '#ffebee';
+                        default: return '#f5f5f5';
+                      }
+                    };
+
+                    const getIcon = (status) => {
+                      switch (status) {
+                        case 'success': return <CheckCircle color="success" fontSize="small" />;
+                        case 'skipped': return <CheckCircle color="info" fontSize="small" />;
+                        case 'error': return <Error color="error" fontSize="small" />;
+                        default: return null;
+                      }
+                    };
+
+                    return (
+                      <Box key={index} sx={{ mb: 1, p: 1, borderRadius: 1, bgcolor: getBgColor(result.status) }}>
+                        <Box display="flex" alignItems="center" gap={1}>
+                          {getIcon(result.status)}
+                          <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
+                            {result.user}
+                          </Typography>
+                        </Box>
+                        <Typography variant="caption" color="text.secondary" sx={{ ml: 3 }}>
+                          {result.message}
                         </Typography>
                       </Box>
-                      <Typography variant="caption" color="text.secondary" sx={{ ml: 3 }}>
-                        {result.message}
-                      </Typography>
-                    </Box>
-                  ))}
+                    );
+                  })}
                 </Box>
               </Paper>
             </Box>

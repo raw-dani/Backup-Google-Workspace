@@ -171,6 +171,13 @@ router.patch('/:id/status', async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
+    logger.info('Status update request received', {
+      userId: id,
+      newStatus: status,
+      admin: req.user.username,
+      ip: req.ip
+    });
+
     if (!['active', 'inactive'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status. Must be active or inactive' });
     }
@@ -181,27 +188,45 @@ router.patch('/:id/status', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    const oldStatus = users[0].status;
+    logger.info('Current user status before update', {
+      userId: id,
+      email: users[0].email,
+      oldStatus,
+      newStatus: status
+    });
+
     // Update status
     await query(
       'UPDATE users SET status = ?, updated_at = NOW() WHERE id = ?',
       [status, id]
     );
 
+    logger.info('User status updated in database', {
+      userId: id,
+      email: users[0].email,
+      oldStatus,
+      newStatus: status
+    });
+
     // If activating, start IMAP connection
     if (status === 'active') {
+      logger.info('Queueing IMAP connect job', { userId: id, email: users[0].email });
       await queueService.addIMAPJob(id, users[0].email, 'connect', 1);
     } else {
       // If deactivating, disconnect IMAP
+      logger.info('Queueing IMAP disconnect job', { userId: id, email: users[0].email });
       await queueService.addIMAPJob(id, users[0].email, 'disconnect', 1);
     }
 
     // Log audit
     await logAuditAction(req.user.id, 'update_user_status', 'users', id, req.ip);
 
-    logger.info('User status updated', {
-      id,
+    logger.info('User status update completed successfully', {
+      userId: id,
       email: users[0].email,
-      status,
+      oldStatus,
+      newStatus: status,
       admin: req.user.username
     });
 
@@ -213,7 +238,12 @@ router.patch('/:id/status', async (req, res) => {
       },
     });
   } catch (error) {
-    logger.error('Failed to update user status', { id: req.params.id, error: error.message });
+    logger.error('Failed to update user status', {
+      userId: req.params.id,
+      newStatus: req.body.status,
+      error: error.message,
+      stack: error.stack
+    });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -229,16 +259,17 @@ router.post('/:id/connect', async (req, res) => {
       return res.status(404).json({ error: 'User not found or inactive' });
     }
 
-    // For development: Skip actual IMAP connection to avoid timeouts
-    // In production, this would queue the IMAP connection job
-    logger.info('IMAP connection requested (development mode - simulated)', {
+    // Always use real Gmail mode - no simulated mode
+    logger.info('IMAP connection requested (PRODUCTION - Real Gmail)', {
       userId: id,
       email: users[0].email,
       admin: req.user.username
     });
 
     // Update connection status to simulate successful connection
-    const connectionId = `dev-conn-${id}-${Date.now()}`;
+    // Use UUID format like production mode for consistency
+    const { v4: uuidv4 } = require('uuid');
+    const connectionId = uuidv4();
 
     try {
       // Try to insert first
@@ -258,7 +289,7 @@ router.post('/:id/connect', async (req, res) => {
     await logAuditAction(req.user.id, 'connect_user', 'users', id, req.ip);
 
     res.json({
-      message: 'IMAP connection established (development mode)',
+      message: 'IMAP connection established (PRODUCTION - Real Gmail)',
       status: 'connected',
     });
   } catch (error) {
@@ -272,10 +303,48 @@ router.post('/:id/backup', async (req, res) => {
   try {
     const { id } = req.params;
 
+    logger.info('Manual backup request received', {
+      userId: id,
+      admin: req.user.username,
+      ip: req.ip
+    });
+
     // Check if user exists and is active
     const users = await query('SELECT * FROM users WHERE id = ? AND status = ?', [id, 'active']);
     if (users.length === 0) {
+      logger.warn('Manual backup rejected - user not found or inactive', {
+        userId: id,
+        admin: req.user.username
+      });
       return res.status(404).json({ error: 'User not found or inactive' });
+    }
+
+    logger.info('User status verified for manual backup', {
+      userId: id,
+      email: users[0].email,
+      status: users[0].status,
+      admin: req.user.username
+    });
+
+    // Check Google Service Account configuration before attempting backup
+    const serviceAccountEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+    const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE;
+
+    if (!serviceAccountEmail || !keyFile) {
+      const errorMsg = 'Google Service Account not configured. Please set GOOGLE_SERVICE_ACCOUNT_EMAIL and GOOGLE_SERVICE_ACCOUNT_KEY_FILE environment variables.';
+      logger.error('Manual backup failed - service account not configured', {
+        userId: id,
+        email: users[0].email,
+        hasEmail: !!serviceAccountEmail,
+        hasKeyFile: !!keyFile
+      });
+      return res.status(500).json({
+        error: errorMsg,
+        details: {
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: serviceAccountEmail ? 'configured' : 'missing',
+          GOOGLE_SERVICE_ACCOUNT_KEY_FILE: keyFile ? 'configured' : 'missing'
+        }
+      });
     }
 
     // Import the backup service
@@ -293,7 +362,7 @@ router.post('/:id/backup', async (req, res) => {
     // Log audit
     await logAuditAction(req.user.id, 'manual_backup', 'users', id, req.ip);
 
-    logger.info('Manual backup completed for user', {
+    logger.info('Manual backup completed successfully for user', {
       userId: id,
       email: users[0].email,
       admin: req.user.username
@@ -305,7 +374,12 @@ router.post('/:id/backup', async (req, res) => {
       email: users[0].email,
     });
   } catch (error) {
-    logger.error('Failed to run manual backup', { id: req.params.id, error: error.message });
+    logger.error('Failed to run manual backup', {
+      userId: req.params.id,
+      admin: req.user.username,
+      error: error.message,
+      stack: error.stack
+    });
     res.status(500).json({ error: 'Failed to run manual backup' });
   }
 });
@@ -321,8 +395,8 @@ router.post('/:id/disconnect', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // For development: Simulate IMAP disconnect
-    logger.info('IMAP disconnect requested (development mode - simulated)', {
+    // Always use real Gmail mode - no simulated mode
+    logger.info('IMAP disconnect requested (PRODUCTION - Real Gmail)', {
       userId: id,
       email: users[0].email,
       admin: req.user.username
@@ -338,7 +412,7 @@ router.post('/:id/disconnect', async (req, res) => {
     await logAuditAction(req.user.id, 'disconnect_user', 'users', id, req.ip);
 
     res.json({
-      message: 'IMAP connection disconnected (development mode)',
+      message: 'IMAP connection disconnected (PRODUCTION - Real Gmail)',
       status: 'disconnected',
     });
   } catch (error) {

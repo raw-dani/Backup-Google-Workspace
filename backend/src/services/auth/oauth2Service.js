@@ -35,7 +35,7 @@ class OAuth2Service {
     }
   }
 
-  async generateXOAuth2Token(userEmail) {
+  async generateAccessToken(userEmail, retryCount = 0) {
     try {
       if (!this.auth) {
         await this.initialize();
@@ -45,31 +45,76 @@ class OAuth2Service {
       const client = await this.auth.getClient();
       client.subject = userEmail;
 
-      // Get access token
-      const accessToken = await client.getAccessToken();
+      // Get access token with refresh logic
+      let accessToken;
+      try {
+        accessToken = await client.getAccessToken();
 
-      if (!accessToken.token) {
-        throw new Error('Failed to obtain access token');
+        // If token is expired or will expire soon, refresh it
+        if (!accessToken.token || (accessToken.expiry_date && accessToken.expiry_date - Date.now() < 300000)) {
+          logger.info('Token expired or will expire soon, refreshing...', { userEmail });
+          await client.refreshAccessToken();
+          accessToken = await client.getAccessToken();
+        }
+      } catch (tokenError) {
+        logger.warn('Token refresh failed, reinitializing client...', { userEmail, error: tokenError.message });
+
+        // Reinitialize client and try again
+        await this.initialize();
+        const newClient = await this.auth.getClient();
+        newClient.subject = userEmail;
+        accessToken = await newClient.getAccessToken();
+        client = newClient;
       }
 
-      // Generate XOAUTH2 token
-      const xoauth2Token = Buffer.from(
-        `user=${userEmail}\x01auth=Bearer ${accessToken.token}\x01\x01`
-      ).toString('base64');
+      if (!accessToken.token) {
+        throw new Error('Failed to obtain access token after refresh');
+      }
 
-      logger.info('XOAUTH2 token generated successfully', { userEmail });
+      // VALIDATE TOKEN FORMAT - Should be OAuth2 access token starting with "ya29."
+      const token = accessToken.token;
+      if (!token.startsWith('ya29.')) {
+        logger.error('Invalid token format - not an OAuth2 access token', {
+          userEmail,
+          tokenLength: token.length,
+          tokenPreview: token.substring(0, 20),
+          expectedFormat: 'ya29.xxxx...'
+        });
+        throw new Error('Generated token is not a valid OAuth2 access token');
+      }
+
+      logger.info('OAuth2 access token generated successfully', {
+        userEmail,
+        tokenLength: token.length,
+        tokenPreview: token.substring(0, 20),
+        tokenExpiry: accessToken.expiry_date ? new Date(accessToken.expiry_date).toISOString() : 'unknown',
+        retryCount
+      });
 
       return {
-        token: xoauth2Token,
-        expiresAt: accessToken.rescored ? new Date(Date.now() + 3600000) : null, // 1 hour
+        token: token, // Return RAW OAuth2 access token, NOT XOAUTH2 formatted string
+        expiresAt: accessToken.expiry_date ? new Date(accessToken.expiry_date) : new Date(Date.now() + 3600000),
       };
     } catch (error) {
-      logger.error('Failed to generate XOAUTH2 token', {
+      // Retry once on token errors
+      if (retryCount === 0 && (error.message.includes('expired') || error.message.includes('invalid'))) {
+        logger.warn('Token error detected, retrying once...', { userEmail, error: error.message });
+        return this.generateAccessToken(userEmail, retryCount + 1);
+      }
+
+      logger.error('Failed to generate OAuth2 access token', {
         userEmail,
-        error: error.message
+        error: error.message,
+        retryCount,
+        stack: error.stack
       });
       throw error;
     }
+  }
+
+  // Keep old method for backward compatibility, but use new implementation
+  async generateXOAuth2Token(userEmail, retryCount = 0) {
+    return this.generateAccessToken(userEmail, retryCount);
   }
 
   async validateServiceAccount() {
