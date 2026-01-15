@@ -68,6 +68,15 @@ class ImapService {
     }
   }
 
+  // REKOMENDASI: Pindahkan fungsi sanitasi ke level class atau utility
+  sanitizeForDb(text) {
+    if (!text) return null;
+    return text
+      .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '') // Hapus Emoji (Karakter 4-byte)
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '') // Hapus Control Chars
+      .substring(0, 500); // Batasi panjang subjek/email
+  }
+
   async connect(userEmail, userId) {
     // Always use real Gmail mode - no simulated mode
     return this.connectRealGmail(userEmail, userId);
@@ -79,7 +88,7 @@ class ImapService {
       await this.acquireConnectionSlot();
       slotAcquired = true;
 
-      let tokenData = await oauth2Service.generateXOAuth2Token(userEmail);
+      const tokenData = await oauth2Service.generateXOAuth2Token(userEmail);
 
       const imapConfig = {
         host: 'imap.gmail.com',
@@ -89,15 +98,17 @@ class ImapService {
         auth: {
           user: userEmail,
           accessToken: tokenData.token
-        }
+        },
+        // Tambahkan timeout internal imapflow
+        connectTimeout: 30000,
       };
 
       const imap = new ImapFlow(imapConfig);
       const connectionId = uuidv4();
 
-      // Error handler internal imapflow
       imap.on('error', (err) => {
         logger.error('IMAP Internal Error', { userEmail, msg: err.message });
+        // Jika error fatal, lepaskan slot secara proaktif
       });
 
       await imap.connect();
@@ -115,10 +126,7 @@ class ImapService {
       return { imap, connectionId };
 
     } catch (error) {
-      // CRITICAL: Jika slot sudah diambil tapi koneksi gagal, lepas slotnya!
-      if (slotAcquired) {
-        this.releaseConnectionSlot();
-      }
+      if (slotAcquired) this.releaseConnectionSlot();
       logger.error('Failed to connect IMAP', { userEmail, error: error.message });
       throw error;
     }
@@ -366,7 +374,7 @@ class ImapService {
       const parsed = await simpleParser(rawContent);
 
       // 2. Simpan File EML
-      const emlPath = await this.storeEmlFile(rawContent, userEmail, parsed.date || new Date(), folder);
+      const emlPath = await this.storeEmlFile(rawContent, userEmail, parsed.date || new Date(), parsed.messageId, folder);
       logger.info(`EML Saved: ${emlPath}`);
 
       // 3. Simpan ke Database
@@ -397,7 +405,8 @@ class ImapService {
     }
   }
 
-  async storeEmlFile(emlContent, userEmail, date, folder = 'INBOX') {
+  // Update storeEmlFile agar menerima messageId langsung
+  async storeEmlFile(emlContent, userEmail, date, messageId, folder = 'INBOX') {
     try {
       const domain = userEmail.split('@')[1];
       const user = userEmail.split('@')[0];
@@ -407,8 +416,9 @@ class ImapService {
       const dirPath = path.join(this.backupDir, domain, user, year.toString(), month);
       await fs.mkdir(dirPath, { recursive: true });
 
-      const messageId = this.extractMessageId(emlContent);
-      const filename = `${messageId}.eml`;
+      // Bersihkan Message-ID dari karakter ilegal untuk nama file
+      const safeId = messageId.replace(/[^a-zA-Z0-9.@_-]/g, '_');
+      const filename = `${safeId}.eml`;
       const filePath = path.join(dirPath, filename);
 
       await fs.writeFile(filePath, emlContent);
@@ -421,25 +431,15 @@ class ImapService {
 
   async storeEmailMetadata(userId, parsedEmail, emlPath, size, folder = 'INBOX') {
     try {
-      const sanitizeText = (text) => {
-        if (!text) return null;
-        // Menghapus emoji dan karakter 4-byte UTF-8 agar aman untuk utf8mb3
-        // Jika database belum diupgrade ke utf8mb4
-        return text
-          .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '') // Remove emoji/surrogate pairs
-          .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '') // Remove control chars
-          .substring(0, 500);
-      };
-
       const sql = `INSERT IGNORE INTO emails (user_id, message_id, subject, from_email, to_email, date, eml_path, size, folder, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`;
 
       const params = [
         userId,
         parsedEmail.messageId || uuidv4(),
-        sanitizeText(parsedEmail.subject),
-        sanitizeText(parsedEmail.from?.text),
-        sanitizeText(parsedEmail.to?.text),
+        this.sanitizeForDb(parsedEmail.subject),
+        this.sanitizeForDb(parsedEmail.from?.text),
+        this.sanitizeForDb(parsedEmail.to?.text),
         parsedEmail.date || new Date(),
         emlPath,
         size,
