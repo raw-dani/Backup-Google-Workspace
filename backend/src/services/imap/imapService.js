@@ -22,7 +22,7 @@ const logger = winston.createLogger({
 // Rate limiter untuk Google Workspace compliance - Sequential IMAP mode
 // Values can be overridden via environment variables with better defaults
 const RATE_LIMITS = {
-  MAX_CONCURRENT_CONNECTIONS: parseInt(process.env.MAX_CONCURRENT_CONNECTIONS || '1'), // Sequential IMAP
+  MAX_CONCURRENT_CONNECTIONS: parseInt(process.env.MAX_CONCURRENT_CONNECTIONS || '2'), // Naik dari 1 ke 2 untuk concurrency
   IDLE_REFRESH_INTERVAL: 25 * 60 * 1000,
   BATCH_SIZE: parseInt(process.env.BATCH_SIZE || '100'), // Increased for faster processing
   FETCH_TIMEOUT: parseInt(process.env.FETCH_TIMEOUT || '120000'), // 2 minutes for large batches
@@ -33,9 +33,9 @@ const RATE_LIMITS = {
 class ImapService {
   constructor() {
     this.connections = new Map();
-    this.backupDir = process.env.BACKUP_DIR || './backup';
     this.isProcessing = new Map();
-    this.activeConnections = 0;
+    this.pendingConnections = 0; // Counter khusus untuk proses handshake
+    this.backupDir = process.env.BACKUP_DIR || './backup';
 
     // Always use real Gmail mode - no development mode
     logger.info('IMAP Service initialized in PRODUCTION (Real Gmail) mode', {
@@ -46,26 +46,32 @@ class ImapService {
     });
   }
 
+  // --- SLOT MANAGEMENT (SELF-HEALING) ---
   async acquireConnectionSlot() {
-    const waitTime = 1000;
     const maxWait = 60000;
     let waited = 0;
 
-    while (this.activeConnections >= RATE_LIMITS.MAX_CONCURRENT_CONNECTIONS) {
+    // Slot dihitung dari: Koneksi Aktif di Map + Proses yang sedang Connecting
+    while ((this.connections.size + this.pendingConnections) >= RATE_LIMITS.MAX_CONCURRENT_CONNECTIONS) {
       if (waited >= maxWait) {
+        // Jika stuck lebih dari 1 menit padahal Map kosong, paksa reset pending counter
+        if (this.connections.size === 0 && this.pendingConnections > 0) {
+          logger.warn('Force resetting pending connection counter (Stuck detected)');
+          this.pendingConnections = 0;
+          break;
+        }
         throw new Error('Connection pool exhausted, please try again later');
       }
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-      waited += waitTime;
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      waited += 2000;
     }
-    this.activeConnections++;
+    this.pendingConnections++;
     return true;
   }
 
-  releaseConnectionSlot() {
-    if (this.activeConnections > 0) {
-      this.activeConnections--;
-    }
+  releasePendingSlot() {
+    if (this.pendingConnections > 0) this.pendingConnections--;
+    logger.info(`Slot Status - Active: ${this.connections.size}, Pending: ${this.pendingConnections}`);
   }
 
   // REKOMENDASI: Pindahkan fungsi sanitasi ke level class atau utility
@@ -83,52 +89,35 @@ class ImapService {
   }
 
   async connectRealGmail(userEmail, userId) {
-    let slotAcquired = false;
     try {
       await this.acquireConnectionSlot();
-      slotAcquired = true;
 
       const tokenData = await oauth2Service.generateXOAuth2Token(userEmail);
-
-      const imapConfig = {
+      const imap = new ImapFlow({
         host: 'imap.gmail.com',
         port: 993,
         secure: true,
-        saslMechanism: 'XOAUTH2',
-        auth: {
-          user: userEmail,
-          accessToken: tokenData.token
-        },
-        // Tambahkan timeout internal imapflow
+        auth: { user: userEmail, accessToken: tokenData.token },
         connectTimeout: 30000,
-      };
-
-      const imap = new ImapFlow(imapConfig);
-      const connectionId = uuidv4();
-
-      imap.on('error', (err) => {
-        logger.error('IMAP Internal Error', { userEmail, msg: err.message });
-        // Jika error fatal, lepaskan slot secara proaktif
+        logger: false // Matikan logger internal agar tidak spam log
       });
 
       await imap.connect();
 
       this.connections.set(userId, {
         imap,
-        connectionId,
         userEmail,
         userId,
-        connectedAt: new Date(),
-        simulated: false,
+        connectionId: uuidv4()
       });
 
-      await this.updateConnectionStatus(userId, connectionId, 'connected');
-      return { imap, connectionId };
-
+      return { imap };
     } catch (error) {
-      if (slotAcquired) this.releaseConnectionSlot();
-      logger.error('Failed to connect IMAP', { userEmail, error: error.message });
+      logger.error('IMAP Connection Failed', { userEmail, error: error.message });
       throw error;
+    } finally {
+      // Selalu lepaskan status PENDING, baik sukses maupun gagal
+      this.releasePendingSlot();
     }
   }
 
@@ -354,54 +343,72 @@ class ImapService {
 
   async fetchAndStoreMessage(imap, uid, userId, userEmail, folder = 'INBOX') {
     try {
-      const messages = await this.fetchMessages(imap, uid.toString(), {
-        source: true,
+      // TAHAP 1: Light Fetch (Hanya ambil Envelope/Message-ID)
+      const lightMessages = await this.fetchMessages(imap, uid.toString(), {
         envelope: true,
-        internalDate: true,
+        uid: true // Pastikan UID disertakan
       });
 
-      if (!messages || messages.length === 0 || !messages[0].sourceBuffer) {
-        // Jika email kosong/ghost, lompati
+      if (!lightMessages || lightMessages.length === 0) {
         await this.updateLastUidByFolder(userId, folder, uid);
         return null;
       }
 
-      const message = messages[0];
-      const rawContent = message.sourceBuffer;
-      logger.info(`Parsing email UID ${uid}...`, { size: rawContent.length });
+      const msgInfo = lightMessages[0];
+      const messageId = msgInfo.envelope?.messageId || `no-id-${uid}-${userId}`;
 
-      // 1. Parsing
+      // TAHAP 2: Cek Database SEBELUM download Source (Heavy)
+      const existing = await query('SELECT id FROM emails WHERE message_id = ? AND user_id = ?', [messageId, userId]);
+      const isDuplicate = Array.isArray(existing) ? existing[0]?.length > 0 : existing?.id;
+
+      if (isDuplicate) {
+        // logger.debug(`Skipping Duplicate UID ${uid}`); // Opsional, agar log tidak penuh
+        await this.updateLastUidByFolder(userId, folder, uid);
+        return null;
+      }
+
+      // TAHAP 3: Heavy Fetch (Hanya jika email benar-benar baru)
+      logger.info(`Downloading New Email UID ${uid}...`);
+      const fullMessages = await this.fetchMessages(imap, uid.toString(), {
+        source: true,
+        internalDate: true,
+      });
+
+      if (!fullMessages || !fullMessages[0].sourceBuffer) {
+        await this.updateLastUidByFolder(userId, folder, uid);
+        return null;
+      }
+
+      const rawContent = fullMessages[0].sourceBuffer;
+
+      // Monitor RAM saat memproses file besar
+      if (rawContent.length > 10 * 1024 * 1024) {
+        logger.info(`Handling Large Email (${(rawContent.length/1024/1024).toFixed(2)} MB)`, { uid });
+      }
+
+      // Parsing menggunakan simpleParser
       const parsed = await simpleParser(rawContent);
 
-      // 2. Simpan File EML
-      const emlPath = await this.storeEmlFile(rawContent, userEmail, parsed.date || new Date(), parsed.messageId, folder);
-      logger.info(`EML Saved: ${emlPath}`);
+      // Simpan EML (Gunakan messageId hasil parsing agar tidak split buffer lagi)
+      const emlPath = await this.storeEmlFile(rawContent, userEmail, parsed.date || new Date(), messageId, folder);
 
-      // 3. Simpan ke Database
-      logger.info(`Inserting to DB UID ${uid}...`);
+      // Simpan Metadata
       const emailId = await this.storeEmailMetadata(userId, parsed, emlPath, rawContent.length, folder);
 
       if (emailId) {
         if (parsed.attachments?.length > 0) {
           await this.storeAttachments(emailId, parsed.attachments);
         }
-
         await this.updateLastUidByFolder(userId, folder, uid);
-
-        // LOG INFO AGAR TERLIHAT DI CONSOLE
-        logger.info(`✓ SUCCESS: UID ${uid} saved with ID ${emailId}`);
+        logger.info(`✓ SUCCESS: UID ${uid} saved`, { emailId, subject: this.sanitizeForDb(parsed.subject) });
         return emailId;
-      } else {
-        logger.warn(`! SKIPPED: UID ${uid} mungkin duplikat.`);
-        await this.updateLastUidByFolder(userId, folder, uid);
       }
 
       return null;
     } catch (error) {
-      logger.error(`CRITICAL ERROR UID ${uid}:`, { msg: error.message });
-      // Tetap update UID agar tidak stuck di email yang rusak
+      logger.error(`Error UID ${uid}:`, { msg: error.message });
       await this.updateLastUidByFolder(userId, folder, uid);
-      throw error;
+      return null;
     }
   }
 
