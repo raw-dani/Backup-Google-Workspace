@@ -22,12 +22,14 @@ const logger = winston.createLogger({
 // Rate limiter untuk Google Workspace compliance - Sequential IMAP mode
 // Values can be overridden via environment variables with better defaults
 const RATE_LIMITS = {
-  MAX_CONCURRENT_CONNECTIONS: parseInt(process.env.MAX_CONCURRENT_CONNECTIONS || '2'), // Naik dari 1 ke 2 untuk concurrency
+  MAX_CONCURRENT_CONNECTIONS: parseInt(process.env.MAX_CONCURRENT_CONNECTIONS || '1'), // Reduced to 1 for Gmail stability
   IDLE_REFRESH_INTERVAL: 25 * 60 * 1000,
-  BATCH_SIZE: parseInt(process.env.BATCH_SIZE || '100'), // Increased for faster processing
+  BATCH_SIZE: parseInt(process.env.BATCH_SIZE || '50'), // Reduced batch size for stability
   FETCH_TIMEOUT: parseInt(process.env.FETCH_TIMEOUT || '120000'), // 2 minutes for large batches
-  RETRY_ATTEMPTS: 3,
-  RETRY_DELAY: parseInt(process.env.RETRY_DELAY || '2000'), // Reduced delay
+  RETRY_ATTEMPTS: 5, // Increased retry attempts
+  RETRY_DELAY: parseInt(process.env.RETRY_DELAY || '3000'), // Increased base delay
+  MAX_RETRY_DELAY: 30000, // Maximum delay between retries
+  FETCH_DELAY: parseInt(process.env.FETCH_DELAY || '800'), // Delay between individual fetches
 };
 
 class ImapService {
@@ -51,9 +53,28 @@ class ImapService {
     const maxWait = 60000;
     let waited = 0;
 
+    // LOGGING: Track slot acquisition attempts
+    logger.debug('Attempting to acquire connection slot', {
+      activeConnections: this.connections.size,
+      pendingConnections: this.pendingConnections,
+      maxConcurrent: RATE_LIMITS.MAX_CONCURRENT_CONNECTIONS,
+      currentTotal: this.connections.size + this.pendingConnections,
+      timestamp: new Date().toISOString()
+    });
+
     // Slot dihitung dari: Koneksi Aktif di Map + Proses yang sedang Connecting
     while ((this.connections.size + this.pendingConnections) >= RATE_LIMITS.MAX_CONCURRENT_CONNECTIONS) {
       if (waited >= maxWait) {
+        // LOGGING: Pool exhaustion details
+        logger.error('Connection pool exhausted - detailed analysis', {
+          activeConnections: this.connections.size,
+          pendingConnections: this.pendingConnections,
+          maxConcurrent: RATE_LIMITS.MAX_CONCURRENT_CONNECTIONS,
+          waitedMs: waited,
+          connectionIds: Array.from(this.connections.keys()),
+          timestamp: new Date().toISOString()
+        });
+
         // Jika stuck lebih dari 1 menit padahal Map kosong, paksa reset pending counter
         if (this.connections.size === 0 && this.pendingConnections > 0) {
           logger.warn('Force resetting pending connection counter (Stuck detected)');
@@ -66,6 +87,14 @@ class ImapService {
       waited += 2000;
     }
     this.pendingConnections++;
+
+    // LOGGING: Slot acquired successfully
+    logger.debug('Connection slot acquired', {
+      activeConnections: this.connections.size,
+      pendingConnections: this.pendingConnections,
+      timestamp: new Date().toISOString()
+    });
+
     return true;
   }
 
@@ -81,6 +110,69 @@ class ImapService {
       .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '') // Hapus Emoji (Karakter 4-byte)
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '') // Hapus Control Chars
       .substring(0, 500); // Batasi panjang subjek/email
+  }
+
+  // Retry mechanism with exponential backoff for IMAP operations
+  async retryWithBackoff(operation, operationName, userEmail, maxAttempts = RATE_LIMITS.RETRY_ATTEMPTS) {
+    let attempt = 0;
+    let lastError;
+
+    while (attempt < maxAttempts) {
+      try {
+        return await operation();
+      } catch (error) {
+        attempt++;
+        lastError = error;
+
+        // Check if error is retryable
+        const isRetryable = this.isRetryableError(error);
+
+        if (!isRetryable || attempt >= maxAttempts) {
+          logger.error(`${operationName} failed after ${attempt} attempts`, {
+            userEmail,
+            error: error.message,
+            isRetryable,
+            finalAttempt: true
+          });
+          throw error;
+        }
+
+        // Calculate delay with exponential backoff
+        const baseDelay = RATE_LIMITS.RETRY_DELAY;
+        const exponentialDelay = baseDelay * Math.pow(2, attempt - 1);
+        const jitter = Math.random() * 1000; // Add jitter to prevent thundering herd
+        const delay = Math.min(exponentialDelay + jitter, RATE_LIMITS.MAX_RETRY_DELAY);
+
+        logger.warn(`${operationName} failed, retrying in ${Math.round(delay)}ms`, {
+          userEmail,
+          attempt,
+          maxAttempts,
+          error: error.message,
+          delayMs: Math.round(delay)
+        });
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    throw lastError;
+  }
+
+  // Determine if an error is retryable
+  isRetryableError(error) {
+    const retryableMessages = [
+      'Connection not available',
+      'Connection pool exhausted',
+      'TIMEOUT',
+      'ECONNRESET',
+      'ENOTFOUND',
+      'Authentication failed',
+      'Mailbox lock',
+      'Temporary failure'
+    ];
+
+    const errorMessage = error.message?.toLowerCase() || '';
+    return retryableMessages.some(msg => errorMessage.includes(msg.toLowerCase()));
   }
 
   async connect(userEmail, userId) {
@@ -406,7 +498,36 @@ class ImapService {
 
       return null;
     } catch (error) {
-      logger.error(`Error UID ${uid}:`, { msg: error.message });
+      // ENHANCED LOGGING: Connection state during fetch failure
+      logger.error(`Error UID ${uid} - connection analysis:`, {
+        msg: error.message,
+        errorCode: error.code,
+        connectionState: imap?.state,
+        authenticated: imap?.authenticated,
+        mailbox: imap?.mailbox?.path,
+        userEmail,
+        folder,
+        timestamp: new Date().toISOString()
+      });
+
+      // CONNECTION RECOVERY: If connection error, try to recover
+      if (this.isRetryableError(error) && imap && imap.state !== 'authenticated') {
+        logger.warn(`Attempting connection recovery for UID ${uid}`, { userEmail, folder });
+        try {
+          // Try to reopen mailbox
+          await this.openMailbox(imap, folder, true);
+          logger.info(`Connection recovered for UID ${uid}`, { userEmail, folder });
+          // Retry the operation once after recovery
+          return await this.fetchAndStoreMessage(imap, uid, userId, userEmail, folder);
+        } catch (recoveryError) {
+          logger.error(`Connection recovery failed for UID ${uid}`, {
+            userEmail,
+            folder,
+            recoveryError: recoveryError.message
+          });
+        }
+      }
+
       await this.updateLastUidByFolder(userId, folder, uid);
       return null;
     }
@@ -595,7 +716,20 @@ class ImapService {
   }
 
   async fetchMessages(imap, uids, options) {
-    try {
+    const userEmail = this.connections.get(Array.from(this.connections.keys()).find(key =>
+      this.connections.get(key)?.imap === imap
+    ))?.userEmail || 'unknown';
+
+    return this.retryWithBackoff(async () => {
+      // LOGGING: Track connection state before fetch
+      logger.debug('IMAP fetch attempt', {
+        uids: Array.isArray(uids) ? uids.length : uids,
+        connectionState: imap?.state,
+        authenticated: imap?.authenticated,
+        userEmail,
+        timestamp: new Date().toISOString()
+      });
+
       const messages = [];
       // ImapFlow fetch menggunakan async generator
       for await (const message of imap.fetch(uids, options)) {
@@ -606,11 +740,17 @@ class ImapService {
         }
         messages.push(message);
       }
+
+      // LOGGING: Success logging
+      logger.debug('IMAP fetch success', {
+        uids: Array.isArray(uids) ? uids.length : uids,
+        messagesReturned: messages.length,
+        userEmail,
+        timestamp: new Date().toISOString()
+      });
+
       return messages;
-    } catch (error) {
-      logger.error('IMAP fetch failed', { uids, error: error.message });
-      throw error;
-    }
+    }, 'IMAP fetch', userEmail);
   }
 
   // Helper untuk mengubah stream menjadi Buffer
@@ -837,19 +977,52 @@ class ImapService {
     try {
       logger.info('Backing up folder', { userEmail, folder });
 
+      // LOGGING: Check last processed UID for this folder
+      const lastProcessedUid = await this.getLastUidByFolder(userId, folder);
+      logger.info('Backup folder state check', {
+        userEmail,
+        folder,
+        lastProcessedUid,
+        timestamp: new Date().toISOString()
+      });
+
       // Get fresh token for this operation
       const tokenData = await oauth2Service.generateXOAuth2Token(userEmail);
 
       // Open the folder
       await this.openMailbox(imap, folder, true); // Read-only for backup
 
-      // CRITICAL FIX: For Gmail, search ALL messages first to get actual UIDs
-      // Gmail IMAP doesn't guarantee sequential UIDs starting from 1
+      // CRITICAL FIX: For Gmail, search messages from last UID onwards, not ALL
+      // This prevents re-processing already backed up messages
       let results;
       try {
-        const searchCriteria = ['ALL'];
+        let searchCriteria;
+        if (lastProcessedUid > 0) {
+          // Search from last processed UID + 1 onwards
+          searchCriteria = [['UID', `${lastProcessedUid + 1}:*`]];
+          logger.info('Resuming backup from last UID', {
+            userEmail,
+            folder,
+            lastProcessedUid,
+            searchCriteria: searchCriteria[0][1]
+          });
+        } else {
+          // First time backup - search ALL messages
+          searchCriteria = ['ALL'];
+          logger.info('Starting fresh backup - searching ALL messages', {
+            userEmail,
+            folder
+          });
+        }
+
         results = await this.searchMessages(imap, searchCriteria);
-        logger.info('IMAP search completed', { userEmail, folder, uidCount: results.length });
+        logger.info('IMAP search completed', {
+          userEmail,
+          folder,
+          uidCount: results.length,
+          searchCriteria: searchCriteria,
+          lastProcessedUid
+        });
       } catch (searchError) {
         logger.error('IMAP search failed', { userEmail, folder, error: searchError.message });
         throw searchError;
@@ -865,17 +1038,34 @@ class ImapService {
       // CRITICAL FIX: ImapFlow search() returns Set<number>, convert to Array first
       const uids = Array.from(results);
 
+      // LOGGING: Check UID ordering and sort if needed
+      logger.debug('Raw UID analysis', {
+        userEmail,
+        folder,
+        totalUids: uids.length,
+        first10Uids: uids.slice(0, 10),
+        last10Uids: uids.slice(-10),
+        isSorted: uids.length > 1 ? uids.every((uid, i) => i === 0 || uid >= uids[i-1]) : true,
+        timestamp: new Date().toISOString()
+      });
+
+      // CRITICAL FIX: Sort UIDs ascending for chronological processing (oldest first)
+      uids.sort((a, b) => a - b);
+
       logger.info('Starting Gmail-compatible sequential processing', {
         userEmail,
         folder,
-        totalMessages: uids.length
+        totalMessages: uids.length,
+        uidRange: uids.length > 0 ? `${uids[0]}-${uids[uids.length-1]}` : 'none',
+        sortedAscending: true
       });
 
-      // DEBUG: Log sample UIDs to verify they're not sequential
-      logger.info('Gmail UID sample (first 10)', {
+      // DEBUG: Log sample UIDs to verify they're sorted
+      logger.info('Gmail UID sample (first 10, sorted)', {
         userEmail,
         folder,
-        uidSample: uids.slice(0, 10)
+        uidSample: uids.slice(0, 10),
+        isAscending: uids.slice(0, 10).every((uid, i) => i === 0 || uid >= uids[i-1])
       });
 
       let processedCount = 0;
@@ -951,7 +1141,16 @@ class ImapService {
 
           // CRITICAL FIX: Delay between individual messages for Gmail stability
           if (globalIndex < uids.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 300)); // 300ms delay for Gmail
+            const delayMs = RATE_LIMITS.FETCH_DELAY;
+            logger.debug('Delaying between messages', {
+              uid,
+              userEmail,
+              folder,
+              delayMs,
+              nextUid: uids[globalIndex + 1],
+              timestamp: new Date().toISOString()
+            });
+            await new Promise(resolve => setTimeout(resolve, delayMs));
           }
         }
 
