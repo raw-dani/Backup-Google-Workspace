@@ -29,7 +29,11 @@ debugRouter.get('/config-debug', async (req, res) => {
       maxConcurrentUsers: process.env.MAX_CONCURRENT_USERS || '1', // Sequential mode
       batchSize: process.env.BATCH_SIZE || '100',                 // Faster processing
       batchDelay: process.env.BATCH_DELAY || '2000',
-      useRealGmail: process.env.USE_REAL_GMAIL === 'true'
+      useRealGmail: process.env.USE_REAL_GMAIL === 'true',
+      // Add IMAP config
+      maxConcurrentConnections: process.env.MAX_CONCURRENT_CONNECTIONS || '1',
+      nodeEnv: process.env.NODE_ENV,
+      port: process.env.PORT
     };
 
     console.log('✅ Debug backup config response:', config);

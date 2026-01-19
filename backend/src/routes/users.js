@@ -298,7 +298,7 @@ router.post('/:id/connect', async (req, res) => {
   }
 });
 
-// Run manual backup for user
+// Start manual backup for user (async - returns immediately)
 router.post('/:id/backup', async (req, res) => {
   try {
     const { id } = req.params;
@@ -347,40 +347,179 @@ router.post('/:id/backup', async (req, res) => {
       });
     }
 
-    // Import the backup service
-    const { runManualBackup } = require('../services/backup/scheduledBackup');
+    // Check if manual backup is already running for this user
+    const { scheduledBackupService } = require('../services/backup/scheduledBackup');
+    const status = scheduledBackupService.getStatus();
 
-    // Run manual backup
-    logger.info('Starting manual backup for user', {
+    if (status.manualBackupRunning) {
+      logger.warn('Manual backup rejected - already running', {
+        userId: id,
+        email: users[0].email,
+        admin: req.user.username
+      });
+      return res.status(409).json({
+        error: 'Manual backup already running. Please wait for the current backup to complete.',
+        status: 'running'
+      });
+    }
+
+    // Start manual backup asynchronously
+    logger.info('Starting async manual backup for user', {
       userId: id,
       email: users[0].email,
       admin: req.user.username
     });
 
-    await runManualBackup(id);
+    // Run backup in background (don't await)
+    const { runManualBackup } = require('../services/backup/scheduledBackup');
+    runManualBackup(id).then(() => {
+      logger.info('Manual backup completed successfully in background', {
+        userId: id,
+        email: users[0].email,
+        admin: req.user.username
+      });
+    }).catch(async (error) => {
+      logger.error('Manual backup failed in background', {
+        userId: id,
+        email: users[0].email,
+        admin: req.user.username,
+        error: error.message
+      });
+
+      // If backup failed, disconnect IMAP connection to clean up
+      try {
+        const { imapService } = require('../services/imap/imapService');
+        await imapService.disconnect(id);
+        logger.info('IMAP connection cleaned up after backup failure', {
+          userId: id,
+          email: users[0].email
+        });
+      } catch (disconnectError) {
+        logger.warn('Failed to cleanup IMAP connection after backup failure', {
+          userId: id,
+          email: users[0].email,
+          error: disconnectError.message
+        });
+      }
+    });
 
     // Log audit
     await logAuditAction(req.user.id, 'manual_backup', 'users', id, req.ip);
 
-    logger.info('Manual backup completed successfully for user', {
+    // Return immediately with backup ID for status tracking
+    const backupId = `manual_${id}_${Date.now()}`;
+    res.json({
+      message: 'Manual backup started successfully',
+      backupId: backupId,
       userId: id,
       email: users[0].email,
-      admin: req.user.username
+      status: 'running'
     });
 
-    res.json({
-      message: 'Manual backup completed successfully',
-      userId: id,
-      email: users[0].email,
-    });
   } catch (error) {
-    logger.error('Failed to run manual backup', {
+    logger.error('Failed to start manual backup', {
       userId: req.params.id,
       admin: req.user.username,
       error: error.message,
       stack: error.stack
     });
-    res.status(500).json({ error: 'Failed to run manual backup' });
+    res.status(500).json({ error: 'Failed to start manual backup' });
+  }
+});
+
+// Get manual backup status for user
+router.get('/:id/backup/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if user exists
+    const users = await query('SELECT * FROM users WHERE id = ?', [id]);
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Get backup service status
+    const { scheduledBackupService } = require('../services/backup/scheduledBackup');
+    const serviceStatus = scheduledBackupService.getStatus();
+
+    // Get recent backup logs or connection status as proxy for backup progress
+    const connections = await query(
+      'SELECT * FROM imap_connections WHERE user_id = ? ORDER BY last_activity DESC LIMIT 1',
+      [id]
+    );
+
+    let backupStatus = 'idle';
+    let message = 'No backup in progress';
+    let progress = null;
+
+    if (serviceStatus.manualBackupRunning) {
+      backupStatus = 'running';
+      message = 'Manual backup is currently running';
+
+      // Try to get more detailed status from connection
+      if (connections.length > 0) {
+        const connection = connections[0];
+        const lastActivity = new Date(connection.last_activity);
+        const timeSinceActivity = Date.now() - lastActivity.getTime();
+        const isRecent = timeSinceActivity < 5 * 60 * 1000; // 5 minutes
+
+        if (connection.status === 'connected' && isRecent) {
+          message = 'Backup in progress - IMAP connection active';
+          progress = 'Processing emails...';
+        } else if (connection.status === 'idle' && isRecent) {
+          message = 'Backup completed - connection idle';
+          progress = 'Backup finished';
+        } else if (connection.status === 'disconnected') {
+          // Check if it was recently disconnected (might indicate failure)
+          if (timeSinceActivity < 2 * 60 * 1000) { // 2 minutes ago
+            backupStatus = 'failed';
+            message = 'Backup failed - connection lost';
+            progress = 'Connection error occurred';
+          } else {
+            message = 'Backup may have encountered connection issues';
+            progress = 'Checking connection...';
+          }
+        }
+      }
+    } else {
+      // Check if backup recently completed or failed by looking at connection activity
+      if (connections.length > 0) {
+        const connection = connections[0];
+        const lastActivity = new Date(connection.last_activity);
+        const timeSinceActivity = Date.now() - lastActivity.getTime();
+        const recentlyActive = timeSinceActivity < 15 * 60 * 1000; // 15 minutes
+
+        if (recentlyActive) {
+          if (connection.status === 'idle') {
+            backupStatus = 'completed';
+            message = 'Backup completed successfully';
+            progress = 'All emails processed';
+          } else if (connection.status === 'disconnected') {
+            // If recently disconnected and no backup running, it might have failed
+            backupStatus = 'failed';
+            message = 'Backup failed - connection was lost';
+            progress = 'Backup terminated unexpectedly';
+          }
+        }
+      }
+    }
+
+    res.json({
+      userId: id,
+      email: users[0].email,
+      status: backupStatus,
+      message: message,
+      progress: progress,
+      lastActivity: connections[0]?.last_activity || null,
+      connectionStatus: connections[0]?.status || 'unknown'
+    });
+
+  } catch (error) {
+    logger.error('Failed to get manual backup status', {
+      userId: req.params.id,
+      error: error.message
+    });
+    res.status(500).json({ error: 'Failed to get backup status' });
   }
 });
 

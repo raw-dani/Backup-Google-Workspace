@@ -70,6 +70,7 @@ export const usersAPI = {
   connectUser: (id) => api.post(`/users/${id}/connect`),
   disconnectUser: (id) => api.post(`/users/${id}/disconnect`),
   runManualBackup: (id) => api.post(`/users/${id}/backup`),
+  getManualBackupStatus: (id) => api.get(`/users/${id}/backup/status`),
   getUserImapStatus: (id) => api.get(`/users/${id}/imap-status`),
   getUserStats: (id, params) => api.get(`/users/${id}/stats`, { params }),
   deleteUser: (id) => api.delete(`/users/${id}`),

@@ -46,20 +46,33 @@ class ScheduledBackupService {
     }
 
     this.cronJob = cron.schedule(cronExpression, async () => {
-      if (this.isRunning) {
-        logger.warn('Scheduled backup already running, skipping');
+      // Double-check both scheduled and manual backup flags
+      if (this.isRunning || this.manualBackupRunning) {
+        logger.warn('Backup already running (scheduled or manual), skipping scheduled backup', {
+          isRunning: this.isRunning,
+          manualBackupRunning: this.manualBackupRunning
+        });
         return;
       }
 
       try {
         this.isRunning = true;
-        logger.info('Starting scheduled backup (REAL)');
+        logger.info('Starting scheduled backup (REAL)', {
+          intervalMinutes,
+          timestamp: new Date().toISOString()
+        });
 
         await this.performBackup();
 
-        logger.info('Scheduled backup (REAL) completed successfully');
+        logger.info('Scheduled backup (REAL) completed successfully', {
+          timestamp: new Date().toISOString()
+        });
       } catch (error) {
-        logger.error('Scheduled backup failed', { error: error.message });
+        logger.error('Scheduled backup failed', {
+          error: error.message,
+          stack: error.stack?.substring(0, 500),
+          timestamp: new Date().toISOString()
+        });
       } finally {
         this.isRunning = false;
       }
@@ -70,6 +83,9 @@ class ScheduledBackupService {
 
   async performBackup() {
     try {
+      // Clean up any stale connections before starting backup
+      await this.cleanupStaleConnections();
+
       // Get all active users
       const users = await query(
         'SELECT id, email FROM users WHERE status = ?',
@@ -122,7 +138,9 @@ class ScheduledBackupService {
           });
 
           // Add delay between users to ensure complete cleanup and avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 3000)); // 3 second delay between users
+          const delayBetweenUsers = 10000; // Increased to 10 seconds for better Gmail stability
+          logger.info(`Waiting ${delayBetweenUsers/1000} seconds before next user`, { userId, userEmail });
+          await new Promise(resolve => setTimeout(resolve, delayBetweenUsers));
 
         } catch (error) {
           logger.error('Failed to backup user mailbox (REAL)', {
@@ -150,6 +168,25 @@ class ScheduledBackupService {
     try {
       logger.info('Starting REAL mailbox backup', { userEmail });
 
+      // Check if there's an existing connection and if it's healthy
+      const hasExistingConnection = imapService.connections.has(userId);
+      let connectionHealthy = false;
+
+      if (hasExistingConnection) {
+        connectionHealthy = await imapService.isConnectionHealthy(userId);
+        logger.info('Existing connection health check', {
+          userId,
+          userEmail,
+          hasConnection: hasExistingConnection,
+          isHealthy: connectionHealthy
+        });
+
+        if (!connectionHealthy) {
+          logger.warn('Existing connection is unhealthy, forcing disconnect', { userId, userEmail });
+          await imapService.forceDisconnect(userId);
+        }
+      }
+
       // Use the comprehensive backupFolder method from imapService
       // This handles all folders, proper batching, and error handling
       await imapService.backupUserMailbox(userId, userEmail);
@@ -166,6 +203,39 @@ class ScheduledBackupService {
     }
   }
 
+  async cleanupStaleConnections() {
+    try {
+      logger.info('Starting stale connection cleanup before backup');
+
+      const activeConnections = Array.from(imapService.connections.keys());
+      let cleanedCount = 0;
+
+      for (const userId of activeConnections) {
+        try {
+          const isHealthy = await imapService.isConnectionHealthy(userId);
+          if (!isHealthy) {
+            logger.warn('Found stale connection, forcing disconnect', { userId });
+            await imapService.forceDisconnect(userId);
+            cleanedCount++;
+          }
+        } catch (error) {
+          logger.error('Error checking connection health', { userId, error: error.message });
+          // Force disconnect on error
+          await imapService.forceDisconnect(userId);
+          cleanedCount++;
+        }
+      }
+
+      logger.info('Stale connection cleanup completed', {
+        checked: activeConnections.length,
+        cleaned: cleanedCount
+      });
+
+    } catch (error) {
+      logger.error('Failed to cleanup stale connections', { error: error.message });
+    }
+  }
+
   async manualBackup(userId = null) {
     // Check if manual backup is already running to prevent concurrent backups
     if (this.manualBackupRunning) {
@@ -179,6 +249,13 @@ class ScheduledBackupService {
       logger.info('Starting manual backup (REAL)', { userId });
 
       if (userId) {
+        // Clean up stale connections for specific user
+        const isHealthy = await imapService.isConnectionHealthy(userId);
+        if (!isHealthy && imapService.connections.has(userId)) {
+          logger.warn('Existing connection unhealthy, forcing disconnect before manual backup', { userId });
+          await imapService.forceDisconnect(userId);
+        }
+
         // Backup specific user
         const users = await query('SELECT email FROM users WHERE id = ?', [userId]);
         if (users.length === 0) {

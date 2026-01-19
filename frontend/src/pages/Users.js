@@ -159,17 +159,92 @@ function Users() {
     }
   };
 
+  const [manualBackupProgress, setManualBackupProgress] = useState(null);
+
   const handleManualBackup = async (user) => {
     try {
       setError(''); // Clear any previous errors
-      await usersAPI.runManualBackup(user.id);
-      alert(`✅ Manual backup completed successfully for ${user.email}`);
-      await loadUsers(); // Refresh to show updated data
+
+      // Start backup
+      const response = await usersAPI.runManualBackup(user.id);
+
+      if (response.data.status === 'running') {
+        // Show progress dialog
+        setManualBackupProgress({
+          user: user,
+          backupId: response.data.backupId,
+          status: 'running',
+          message: 'Starting manual backup...',
+          startTime: Date.now()
+        });
+
+        // Start polling for status
+        pollBackupStatus(user, response.data.backupId);
+      } else {
+        // Handle immediate errors
+        alert(`❌ ${response.data.error || 'Failed to start manual backup'}`);
+      }
     } catch (error) {
-      console.error('Failed to run manual backup:', error);
-      setError('Failed to run manual backup');
-      alert(`❌ Failed to run manual backup for ${user.email}`);
+      console.error('Failed to start manual backup:', error);
+      setError('Failed to start manual backup');
+
+      if (error.response?.status === 409) {
+        alert(`⚠️ ${error.response.data.error}`);
+      } else {
+        alert(`❌ Failed to start manual backup for ${user.email}`);
+      }
     }
+  };
+
+  const pollBackupStatus = async (user, backupId) => {
+    const startTime = Date.now();
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await usersAPI.getManualBackupStatus(user.id);
+        const status = response.data;
+
+        setManualBackupProgress(prev => ({
+          ...prev,
+          status: status.status,
+          message: status.message,
+          progress: status.progress,
+          lastActivity: status.lastActivity
+        }));
+
+        // Check if backup completed or failed
+        if (status.status === 'completed') {
+          clearInterval(pollInterval);
+          setManualBackupProgress(null);
+          alert(`✅ Manual backup completed successfully for ${user.email}`);
+          loadUsers(); // Refresh to show updated data
+        } else if (status.status === 'failed') {
+          clearInterval(pollInterval);
+          setManualBackupProgress(null);
+          alert(`❌ Manual backup failed for ${user.email}. ${status.message}`);
+          loadUsers(); // Refresh to show updated data
+        } else if (status.status === 'idle') {
+          // Check if it's been idle for a while (backup might be finished)
+          const elapsed = Date.now() - startTime;
+          if (elapsed > 2 * 60 * 1000) { // 2 minutes of idle status
+            clearInterval(pollInterval);
+            setManualBackupProgress(null);
+            alert(`✅ Manual backup appears to be completed for ${user.email}`);
+            loadUsers();
+          }
+        }
+      } catch (error) {
+        console.error('Failed to poll backup status:', error);
+        // Continue polling, don't stop on polling errors
+      }
+    }, 3000); // Poll every 3 seconds
+
+    // Stop polling after 30 minutes (safety timeout)
+    setTimeout(() => {
+      clearInterval(pollInterval);
+      setManualBackupProgress(null);
+      alert(`⏰ Manual backup timeout for ${user.email}. The backup may still be running in the background.`);
+      loadUsers();
+    }, 30 * 60 * 1000); // 30 minutes
   };
 
   const handleDeleteUser = async (user) => {
@@ -1488,6 +1563,67 @@ Are you ABSOLUTELY sure you want to proceed?`;
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setBulkDeleteResults(null)}>
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Manual Backup Progress Dialog */}
+      <Dialog
+        open={manualBackupProgress !== null}
+        onClose={() => setManualBackupProgress(null)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          <Box display="flex" alignItems="center" gap={1}>
+            <Sync />
+            Manual Backup Progress
+          </Box>
+        </DialogTitle>
+        <DialogContent>
+          {manualBackupProgress && (
+            <Box textAlign="center" py={2}>
+              <Typography variant="h6" gutterBottom>
+                {manualBackupProgress.user.email}
+              </Typography>
+
+              <Box my={3}>
+                {manualBackupProgress.status === 'running' ? (
+                  <CircularProgress size={60} />
+                ) : manualBackupProgress.status === 'completed' ? (
+                  <CheckCircle color="success" sx={{ fontSize: 60 }} />
+                ) : manualBackupProgress.status === 'failed' ? (
+                  <Error color="error" sx={{ fontSize: 60 }} />
+                ) : (
+                  <Sync color="info" sx={{ fontSize: 60 }} />
+                )}
+              </Box>
+
+              <Typography variant="body1" gutterBottom>
+                {manualBackupProgress.message}
+              </Typography>
+
+              {manualBackupProgress.progress && (
+                <Typography variant="body2" color="text.secondary">
+                  {manualBackupProgress.progress}
+                </Typography>
+              )}
+
+              {manualBackupProgress.lastActivity && (
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                  Last activity: {new Date(manualBackupProgress.lastActivity).toLocaleString()}
+                </Typography>
+              )}
+
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
+                Started: {new Date(manualBackupProgress.startTime).toLocaleString()}
+              </Typography>
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setManualBackupProgress(null)}>
             Close
           </Button>
         </DialogActions>
