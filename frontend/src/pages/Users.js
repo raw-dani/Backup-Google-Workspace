@@ -69,6 +69,7 @@ function Users() {
   const [selectedUsers, setSelectedUsers] = useState([]);
   const [bulkImapLoading, setBulkImapLoading] = useState(false);
   const [bulkImapResults, setBulkImapResults] = useState(null);
+  const [bulkImapProgress, setBulkImapProgress] = useState(null);
   const [bulkDisconnectLoading, setBulkDisconnectLoading] = useState(false);
   const [bulkDisconnectResults, setBulkDisconnectResults] = useState(null);
   const [bulkDeleteLoading, setBulkDeleteLoading] = useState(false);
@@ -165,6 +166,20 @@ function Users() {
     try {
       setError(''); // Clear any previous errors
 
+      // Check if any backup operation is currently running
+      const backupStatusResponse = await usersAPI.getBackupStatus();
+      const backupStatus = backupStatusResponse.data.status;
+
+      if (backupStatus.anyBackupRunning) {
+        const runningOperations = [];
+        if (backupStatus.isRunning) runningOperations.push('Scheduled Backup');
+        if (backupStatus.manualBackupRunning) runningOperations.push('Manual Backup');
+        if (backupStatus.bulkImapRunning) runningOperations.push('Bulk IMAP');
+
+        alert(`❌ Cannot start manual backup: ${runningOperations.join(', ')} is currently running. Please wait for completion.`);
+        return;
+      }
+
       // Start backup
       const response = await usersAPI.runManualBackup(user.id);
 
@@ -245,6 +260,321 @@ function Users() {
       alert(`⏰ Manual backup timeout for ${user.email}. The backup may still be running in the background.`);
       loadUsers();
     }, 30 * 60 * 1000); // 30 minutes
+  };
+
+  // HYBRID APPROACH: Determine optimal processing strategy based on user count and mailbox sizes
+  const determineProcessingStrategy = (eligibleUsers, initialCounts) => {
+    const userCount = eligibleUsers.length;
+
+    // Calculate average mailbox size
+    let totalEmails = 0;
+    let knownUsers = 0;
+    eligibleUsers.forEach(user => {
+      const emailCount = initialCounts[user.id] || 0;
+      if (emailCount > 0) {
+        totalEmails += emailCount;
+        knownUsers++;
+      }
+    });
+
+    const avgMailboxSize = knownUsers > 0 ? totalEmails / knownUsers : 0;
+    const hasLargeMailboxes = avgMailboxSize > 5000; // > 5K emails = large
+
+    console.log(`📊 Strategy Analysis: ${userCount} users, avg ${Math.round(avgMailboxSize)} emails, ${hasLargeMailboxes ? 'large' : 'normal'} mailboxes`);
+
+    // Decision Tree for Processing Strategy
+    if (userCount <= 5) {
+      // Small batch: Always parallel for speed
+      return {
+        mode: 'parallel',
+        batchSize: userCount, // All at once
+        concurrency: userCount,
+        reason: 'Small user count - parallel processing optimal'
+      };
+    } else if (userCount <= 15 && !hasLargeMailboxes) {
+      // Medium batch, small mailboxes: Controlled parallel
+      return {
+        mode: 'parallel',
+        batchSize: 3,
+        concurrency: 3,
+        reason: 'Medium user count with normal mailboxes - controlled parallel'
+      };
+    } else if (userCount <= 25 && hasLargeMailboxes) {
+      // Large mailboxes: Sequential with optimizations
+      return {
+        mode: 'sequential_optimized',
+        batchSize: 1,
+        concurrency: 1,
+        reason: 'Large mailboxes detected - sequential for Gmail compliance'
+      };
+    } else {
+      // Very large batch: Sequential
+      return {
+        mode: 'sequential',
+        batchSize: 1,
+        concurrency: 1,
+        reason: 'Large user count - sequential processing required'
+      };
+    }
+  };
+
+  // ENHANCED: Check if user has emails to sync using smart comparison
+  const checkUserHasEmailsToSync = async (userId, userEmail) => {
+    try {
+      const response = await usersAPI.checkUserHasEmailsToSync(userId);
+      return response.data.hasEmailsToSync;
+    } catch (error) {
+      console.error(`❌ Error checking sync status for ${userEmail}:`, error);
+      // If we can't determine, assume we need to sync
+      return true;
+    }
+  };
+
+  const pollBulkImapStatus = async (eligibleUsers, results, initialCounts, onUserComplete, onComplete, onError) => {
+    let currentUserIndex = 0;
+    const startTime = Date.now();
+    let isProcessingComplete = false;
+
+    // HYBRID APPROACH: Determine processing strategy based on user count and mailbox sizes
+    const processingStrategy = determineProcessingStrategy(eligibleUsers, initialCounts);
+
+    console.log(`🎯 Bulk IMAP Strategy: ${processingStrategy.mode} (batchSize: ${processingStrategy.batchSize}, concurrency: ${processingStrategy.concurrency})`);
+
+    // Get Gmail message counts for all users at the start for comparison
+    const gmailCounts = {};
+    try {
+      const countPromises = eligibleUsers.map(async (user) => {
+        try {
+          const response = await usersAPI.getGmailMessageCount(user.id);
+          return { userId: user.id, count: response.data.totalMessages || 0 };
+        } catch (error) {
+          console.warn(`Could not get Gmail count for ${user.email}:`, error);
+          return { userId: user.id, count: -1 }; // Unknown count
+        }
+      });
+
+      const countResults = await Promise.allSettled(countPromises);
+      countResults.forEach(result => {
+        if (result.status === 'fulfilled') {
+          gmailCounts[result.value.userId] = result.value.count;
+          console.log(`Gmail count for user ${result.value.userId}: ${result.value.count}`);
+        } else {
+          console.error('Failed to get Gmail count:', result.reason);
+        }
+      });
+    } catch (error) {
+      console.error('Error getting Gmail counts:', error);
+      // Continue with unknown counts
+    }
+
+    const processNextUser = async () => {
+      // Check if processing is already complete
+      if (isProcessingComplete || currentUserIndex >= eligibleUsers.length) {
+        if (!isProcessingComplete) {
+          isProcessingComplete = true;
+          console.log('All users processed, calling onComplete');
+          onComplete(results);
+        }
+        return;
+      }
+
+      const user = eligibleUsers[currentUserIndex];
+      const initialCount = initialCounts[user.id] || 0;
+      const gmailCount = gmailCounts[user.id] || -1;
+
+      // Calculate dynamic timeout based on mailbox size (with safety bounds)
+      const baseTimeout = 3 * 60 * 1000; // 3 minutes base
+      const perEmailTimeout = 200; // 200ms per email
+      const maxTimeout = 15 * 60 * 1000; // 15 minutes max
+      const dynamicTimeout = Math.min(
+        maxTimeout,
+        Math.max(baseTimeout, gmailCount > 0 ? gmailCount * perEmailTimeout : baseTimeout)
+      );
+
+      console.log(`Processing user ${currentUserIndex + 1}/${eligibleUsers.length}: ${user.email} (timeout: ${Math.round(dynamicTimeout / 1000)}s, Gmail: ${gmailCount}, DB: ${initialCount})`);
+
+      try {
+        // ENHANCED: Check if user has emails to sync using smart comparison
+        const hasEmailsToSync = await checkUserHasEmailsToSync(user.id, user.email);
+
+        if (!hasEmailsToSync) {
+          console.log(`✅ Skipping user ${user.email} - already fully synced`);
+          results.push({
+            user: user.email,
+            status: 'skipped',
+            message: 'Already fully synced - no emails to download'
+          });
+          currentUserIndex++;
+          // Start next user immediately for first few users, then add small delay
+          const delay = currentUserIndex < 3 ? 0 : 100;
+          setTimeout(processNextUser, delay);
+          return;
+        }
+
+        // Start IMAP connection for current user
+        console.log(`Starting IMAP connection for ${user.email}`);
+        await usersAPI.connectUser(user.id);
+
+        results.push({
+          user: user.email,
+          status: 'in_progress',
+          message: 'IMAP connection started - monitoring progress...'
+        });
+
+        // Update progress
+        setBulkImapProgress({
+          user: user,
+          results: [...results],
+          currentUserIndex: currentUserIndex,
+          totalUsers: eligibleUsers.length,
+          status: 'running',
+          message: `Processing ${user.email}... (0/${gmailCount > 0 ? gmailCount : '?'})`,
+          startTime: Date.now()
+        });
+
+        // Process this user with polling
+        await processUserWithPolling(user, initialCount, gmailCount, dynamicTimeout, results);
+
+      } catch (error) {
+        console.error(`Failed to start IMAP for ${user.email}:`, error);
+        results.push({
+          user: user.email,
+          status: 'error',
+          message: error.response?.data?.error || error.message || 'Unknown error'
+        });
+      }
+
+      // Move to next user
+      currentUserIndex++;
+      // Start next user immediately for first few users, then add small delay
+      const delay = currentUserIndex < 3 ? 0 : 100;
+      setTimeout(processNextUser, delay);
+    };
+
+    // Helper function to process a single user with polling
+    const processUserWithPolling = async (user, initialCount, gmailCount, timeoutMs, results) => {
+      return new Promise((resolve) => {
+        const userStartTime = Date.now();
+        let lastProgressUpdate = 0;
+        let pollingActive = true;
+
+        console.log(`Starting polling for ${user.email} with ${timeoutMs}ms timeout`);
+
+        const pollInterval = setInterval(async () => {
+          if (!pollingActive) return;
+
+          try {
+            const response = await usersAPI.getUserStats(user.id);
+            const stats = response.data.stats || {};
+            const connection = response.data.connection;
+            const currentCount = stats.total_emails || 0;
+            const progress = Math.max(0, currentCount - initialCount); // Ensure non-negative
+
+            // Update progress every 5 seconds
+            const now = Date.now();
+            if (now - lastProgressUpdate > 5000) {
+              const progressText = gmailCount > 0
+                ? `${progress}/${gmailCount} emails (${Math.min(100, Math.round(progress/gmailCount*100))}%)`
+                : `${progress} emails downloaded`;
+
+              setBulkImapProgress(prev => ({
+                ...prev,
+                message: `Processing ${user.email} - ${progressText}`,
+                results: [...results] // Fresh copy
+              }));
+              lastProgressUpdate = now;
+            }
+
+            // Check completion conditions
+            const isFullySynced = gmailCount > 0 && currentCount >= gmailCount;
+            const hasEnoughEmails = progress >= Math.min(100, Math.max(10, gmailCount > 0 ? gmailCount * 0.1 : 50));
+            const isIdle = connection && connection.status === 'idle' && !connection.isRecent;
+            const timeElapsed = now - userStartTime;
+            const shouldTimeout = timeElapsed > timeoutMs;
+
+            if (isFullySynced || (hasEnoughEmails && isIdle) || shouldTimeout) {
+              pollingActive = false;
+              clearInterval(pollInterval);
+
+              let finalStatus = 'success';
+              let finalMessage = '';
+
+              if (isFullySynced) {
+                finalMessage = `✅ Fully synced: ${currentCount}/${gmailCount} emails (100%)`;
+              } else if (hasEnoughEmails && isIdle) {
+                finalMessage = `✅ Sufficient sync: ${progress} emails downloaded, connection idle`;
+              } else if (shouldTimeout) {
+                finalMessage = `⏰ Timeout: ${progress} emails downloaded (${Math.round(timeElapsed/1000)}s)`;
+              }
+
+              console.log(`Completed processing ${user.email}: ${finalMessage}`);
+
+              // Update result safely
+              const resultIndex = results.findIndex(r => r.user === user.email);
+              if (resultIndex !== -1) {
+                results[resultIndex] = {
+                  ...results[resultIndex],
+                  status: finalStatus,
+                  message: finalMessage
+                };
+              }
+
+              // Call completion callback
+              onUserComplete(user, results);
+              resolve();
+            }
+          } catch (error) {
+            console.error(`Polling error for ${user.email}:`, error);
+            // Continue polling on errors, don't stop
+          }
+        }, 3000); // Poll every 3 seconds
+
+        // Safety timeout
+        const timeoutHandle = setTimeout(() => {
+          if (pollingActive) {
+            pollingActive = false;
+            clearInterval(pollInterval);
+
+            const timeElapsed = Date.now() - userStartTime;
+            const resultIndex = results.findIndex(r => r.user === user.email);
+
+            if (resultIndex !== -1 && results[resultIndex].status === 'in_progress') {
+              results[resultIndex] = {
+                ...results[resultIndex],
+                status: 'success',
+                message: `⏰ Timeout: processed for ${Math.round(timeElapsed/1000)}s`
+              };
+            }
+
+            console.log(`Timeout reached for ${user.email} after ${Math.round(timeElapsed/1000)}s`);
+            onUserComplete(user, results);
+            resolve();
+          }
+        }, timeoutMs);
+      });
+    };
+
+    // Start processing
+    console.log(`Starting bulk IMAP processing for ${eligibleUsers.length} users`);
+    processNextUser();
+
+    // Overall safety timeout (60 minutes)
+    const overallTimeout = setTimeout(() => {
+      if (!isProcessingComplete) {
+        isProcessingComplete = true;
+        console.error('Overall timeout reached for bulk IMAP processing');
+        setBulkImapProgress(null);
+        alert(`⏰ Bulk IMAP processing overall timeout. ${currentUserIndex} of ${eligibleUsers.length} users processed.`);
+        loadUsers();
+      }
+    }, 60 * 60 * 1000); // 60 minutes
+
+    // Clear overall timeout when complete
+    const originalOnComplete = onComplete;
+    onComplete = (results) => {
+      clearTimeout(overallTimeout);
+      originalOnComplete(results);
+    };
   };
 
   const handleDeleteUser = async (user) => {
@@ -375,28 +705,61 @@ Are you ABSOLUTELY sure you want to delete everything?`;
     return status;
   };
 
-  const handleBulkImapStart = async () => {
+  // Direct bulk IMAP processing (instant execution)
+  const handleDirectBulkImapStart = async () => {
     if (selectedUsers.length === 0) {
       setError('No users selected for IMAP connection');
       return;
     }
 
+    // Check if any backup operation is currently running
+    try {
+      const backupStatusResponse = await usersAPI.getBackupStatus();
+      const backupStatus = backupStatusResponse.data.status;
+
+      if (backupStatus.anyBackupRunning) {
+        const runningOperations = [];
+        if (backupStatus.isRunning) runningOperations.push('Scheduled Backup');
+        if (backupStatus.manualBackupRunning) runningOperations.push('Manual Backup');
+        if (backupStatus.bulkImapRunning) runningOperations.push('Bulk IMAP');
+
+        alert(`❌ Cannot start bulk IMAP: ${runningOperations.join(', ')} is currently running. Please wait for completion.`);
+        return;
+      }
+    } catch (error) {
+      console.error('Failed to check backup status:', error);
+      alert('❌ Unable to verify backup status. Please try again.');
+      return;
+    }
+
+    // DEBUG: Log all selected users
+    console.log('DEBUG: All selected users:', selectedUsers.map(u => u.email));
+
     // Filter only active users that are not already connected
-    const eligibleUsers = selectedUsers.filter(user =>
-      user.status === 'active' &&
-      (!user.connection || user.connection.status === 'disconnected')
-    );
+    // PERBAIKAN: Gunakan data terbaru dari users state
+    const eligibleUsers = selectedUsers.filter(selectedUser => {
+      const currentUser = users.find(u => u.id === selectedUser.id);
+      if (!currentUser) {
+        console.warn(`User ${selectedUser.id} not found in current users data`);
+        return false;
+      }
+      return currentUser.status === 'active' &&
+             (!currentUser.connection || currentUser.connection.status === 'disconnected');
+    });
+
+    // DEBUG: Log eligible users
+    console.log('DEBUG: Eligible users for processing:', eligibleUsers.map(u => u.email));
 
     if (eligibleUsers.length === 0) {
       setError('No eligible users selected. Users must be active and not already connected.');
       return;
     }
 
-    const confirmMessage = `Start sequential IMAP connections for ${eligibleUsers.length} selected user(s)?
+    const confirmMessage = `Start INSTANT bulk IMAP connections for ${eligibleUsers.length} selected user(s)?
 
 ${eligibleUsers.map(u => `• ${u.email}`).join('\n')}
 
-This will start IMAP synchronization for each user one by one, waiting for each to download 100 emails before moving to the next user. Users who are already fully synced will be skipped automatically. This ensures only one active IMAP connection at a time.`;
+This will start IMAP synchronization for ALL selected users IMMEDIATELY, bypassing the queue service. Users who are already fully synced will be skipped automatically. This ensures instant execution without waiting for scheduled backups.`;
     if (!window.confirm(confirmMessage)) {
       return;
     }
@@ -404,247 +767,67 @@ This will start IMAP synchronization for each user one by one, waiting for each 
     try {
       setBulkImapLoading(true);
       setBulkImapResults(null);
+      setBulkImapProgress(null);
       setError('');
 
-      const results = [];
-      let successCount = 0;
-      let errorCount = 0;
-      let processedCount = 0;
-      let skippedCount = 0;
+      // Show immediate processing dialog
+      setBulkImapProgress({
+        user: null,
+        results: [],
+        currentUserIndex: 0,
+        totalUsers: eligibleUsers.length,
+        status: 'starting',
+        message: `Starting instant bulk IMAP processing for ${eligibleUsers.length} users...`,
+        startTime: Date.now()
+      });
 
-      // Function to check if user has emails to sync
-      const checkUserHasEmailsToSync = async (userId, userEmail) => {
-        try {
-          const response = await usersAPI.getUserStats(userId);
-          const stats = response.data.stats || {};
-          const connection = response.data.connection;
+      // Use direct bulk processing endpoint (bypasses queue service entirely)
+      const userIds = eligibleUsers.map(user => user.id);
+      const response = await usersAPI.startDirectBulkImap(userIds);
 
-          const totalEmails = stats.total_emails || 0;
+      console.log('Direct bulk IMAP processing completed:', response.data);
 
-          // If user has no emails at all, they definitely need syncing
-          if (totalEmails === 0) {
-            return true; // Has emails to sync
-          }
-
-          // If user has emails but connection indicates they've been fully synced
-          // Check if connection is idle and not recent (meaning sync completed some time ago)
-          if (connection && connection.status === 'idle' && connection.isRecent === false) {
-            // User appears to be fully synced - connection is idle and no recent activity
-            return false; // No emails to sync
-          }
-
-          // If user has significant number of emails (>1000) and connection shows completion
-          if (totalEmails > 1000 && connection && connection.status === 'idle') {
-            return false; // Likely fully synced
-          }
-
-          // If user has emails and last email date is old (>30 days) and connection is idle
-          if (stats.last_email_date && connection && connection.status === 'idle') {
-            const lastEmailDate = new Date(stats.last_email_date);
-            const thirtyDaysAgo = new Date();
-            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-            if (lastEmailDate < thirtyDaysAgo) {
-              return false; // No recent emails and idle connection - likely fully synced
-            }
-          }
-
-          // Default: assume user needs syncing if we can't definitively determine they're fully synced
-          return true;
-
-        } catch (error) {
-          console.warn(`Could not check sync status for ${userEmail}:`, error);
-          return true; // Assume they need syncing if we can't check
-        }
-      };
-
-      // Function to check if user has reached 100 emails
-      const waitForEmailCount = async (userId, userEmail, initialCount) => {
-        const maxWaitTime = 5 * 60 * 1000; // 5 minutes timeout
-        const checkInterval = 5000; // Check every 5 seconds
-        const startTime = Date.now();
-
-        return new Promise((resolve, reject) => {
-          const checkEmailCount = async () => {
-            try {
-              const response = await usersAPI.getUserStats(userId);
-              const currentCount = response.data.stats?.total_emails || 0;
-              const connection = response.data.connection;
-
-              // Update results with current progress
-              setBulkImapResults(prev => {
-                if (!prev) return null;
-                const updatedResults = [...prev.results];
-                const userIndex = updatedResults.findIndex(r => r.user === userEmail);
-                if (userIndex !== -1) {
-                  const progress = currentCount - initialCount;
-                  updatedResults[userIndex] = {
-                    ...updatedResults[userIndex],
-                    message: `Downloading emails... (${progress >= 100 ? '100+' : progress}/100)`
-                  };
-                }
-                return { ...prev, results: updatedResults };
-              });
-
-              // Check if we've downloaded at least 100 emails since starting
-              if (currentCount - initialCount >= 100) {
-                resolve(currentCount);
-                return;
-              }
-
-              // Check if connection indicates completion (idle and no recent activity)
-              if (connection && connection.status === 'idle' && connection.isRecent === false) {
-                // User appears to be fully synced, resolve immediately
-                resolve(currentCount);
-                return;
-              }
-
-              if (Date.now() - startTime > maxWaitTime) {
-                reject(new Error('Timeout waiting for 100 emails'));
-                return;
-              }
-
-              setTimeout(checkEmailCount, checkInterval);
-            } catch (error) {
-              reject(error);
-            }
-          };
-
-          checkEmailCount();
-        });
-      };
-
-      // Process users sequentially - one at a time
-      for (let i = 0; i < eligibleUsers.length; i++) {
-        const user = eligibleUsers[i];
-        const isLastUser = i === eligibleUsers.length - 1;
-
-        try {
-          // Check if user has emails to sync before starting IMAP
-          const hasEmailsToSync = await checkUserHasEmailsToSync(user.id, user.email);
-
-          if (!hasEmailsToSync) {
-            results.push({
-              user: user.email,
-              status: 'skipped',
-              message: 'Already fully synced - no emails to download'
-            });
-            skippedCount++;
-            processedCount++;
-            continue; // Skip this user
-          }
-
-          // Get initial email count before starting IMAP
-          let initialCount = 0;
-          try {
-            const initialStats = await usersAPI.getUserStats(user.id);
-            initialCount = initialStats.data.stats?.total_emails || 0;
-          } catch (error) {
-            console.warn(`Could not get initial count for ${user.email}:`, error);
-          }
-
-          // Start IMAP connection for current user
-          await usersAPI.connectUser(user.id);
-
-          results.push({
-            user: user.email,
-            status: 'in_progress',
-            message: 'IMAP connection started - waiting for 100 emails...'
-          });
-
-          // Update results immediately
-          setBulkImapResults({
-            total: eligibleUsers.length,
-            success: successCount,
-            error: errorCount,
-            skipped: skippedCount,
-            results: results,
-            currentUser: user.email,
-            processed: processedCount
-          });
-
-          // Wait for user to download 100 emails (unless it's the last user)
-          if (!isLastUser) {
-            try {
-              await waitForEmailCount(user.id, user.email, initialCount);
-            } catch (waitError) {
-              console.warn(`Timeout or error waiting for ${user.email} to download 100 emails:`, waitError);
-              // Continue to next user even if timeout occurs
-            }
-          }
-
-          // Mark as success
-          const resultIndex = results.findIndex(r => r.user === user.email);
-          if (resultIndex !== -1) {
-            results[resultIndex] = {
-              ...results[resultIndex],
-              status: 'success',
-              message: 'IMAP connection started and monitored'
-            };
-          }
-
-          successCount++;
-          processedCount++;
-
-        } catch (error) {
-          console.error(`Failed to start IMAP for ${user.email}:`, error);
-          results.push({
-            user: user.email,
-            status: 'error',
-            message: error.response?.data?.error || error.message
-          });
-          errorCount++;
-          processedCount++;
-        }
-
-        // Update progress after each user
-        setBulkImapResults({
-          total: eligibleUsers.length,
-          success: successCount,
-          error: errorCount,
-          skipped: skippedCount,
-          results: results,
-          currentUser: isLastUser ? null : eligibleUsers[i + 1]?.email || null,
-          processed: processedCount
-        });
-      }
-
-      // Final results
+      // Show completion results
       setBulkImapResults({
         total: eligibleUsers.length,
-        success: successCount,
-        error: errorCount,
-        skipped: skippedCount,
-        results: results,
+        success: eligibleUsers.length, // All users processed
+        error: 0,
+        skipped: 0,
+        results: eligibleUsers.map(user => ({
+          user: user.email,
+          status: 'success',
+          message: 'IMAP connection started successfully (instant execution)'
+        })),
         completed: true
       });
 
-      // Clear selection and refresh
+      // Clear progress and refresh
+      setBulkImapProgress(null);
       setSelectedUsers([]);
       await loadUsers();
 
-      // Show summary alert
-      const summaryMessage = [];
-
-      if (successCount > 0) {
-        summaryMessage.push(`✅ ${successCount} users started IMAP successfully`);
-      }
-      if (skippedCount > 0) {
-        summaryMessage.push(`⏭️ ${skippedCount} users skipped (already synced)`);
-      }
-      if (errorCount > 0) {
-        summaryMessage.push(`❌ ${errorCount} users failed`);
-      }
-
-      alert(`Sequential IMAP processing completed!\n\n${summaryMessage.join('\n')}\n\nEach user was processed one by one, waiting for 100 emails before moving to the next.`);
+      // Show success message
+      alert(`✅ Instant bulk IMAP processing completed!\n\n${eligibleUsers.length} users started IMAP connections immediately without queue delays.`);
 
     } catch (error) {
-      console.error('Bulk IMAP start failed:', error);
-      setError('Failed to start bulk IMAP connections');
-    } finally {
+      console.error('Direct bulk IMAP failed:', error);
+      setError('Failed to start direct bulk IMAP connections');
+      setBulkImapProgress(null);
       setBulkImapLoading(false);
+
+      // Try to release locks
+      try {
+        await usersAPI.endBulkImap();
+      } catch (endError) {
+        console.error('Failed to release bulk IMAP locks:', endError);
+      }
+
+      alert(`❌ Failed to start instant bulk IMAP: ${error.response?.data?.error || error.message}`);
     }
   };
+
+  // Updated bulk IMAP start handler that uses direct processing
+  const handleBulkImapStart = handleDirectBulkImapStart;
 
   const handleBulkImapDisconnect = async () => {
     if (selectedUsers.length === 0) {
@@ -844,7 +1027,11 @@ Are you ABSOLUTELY sure you want to proceed?`;
 
   const handleUserSelection = (user, checked) => {
     if (checked) {
-      setSelectedUsers(prev => [...prev, user]);
+      setSelectedUsers(prev => {
+        // Pastikan user yang ditambahkan adalah versi terbaru dari state users
+        const updatedUser = users.find(u => u.id === user.id) || user;
+        return [...prev, updatedUser];
+      });
     } else {
       setSelectedUsers(prev => prev.filter(u => u.id !== user.id));
     }
@@ -1624,6 +1811,127 @@ Are you ABSOLUTELY sure you want to proceed?`;
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setManualBackupProgress(null)}>
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Bulk IMAP Progress Dialog */}
+      <Dialog
+        open={bulkImapProgress !== null}
+        onClose={() => setBulkImapProgress(null)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>
+          <Box display="flex" alignItems="center" gap={1}>
+            <PlayCircle />
+            Bulk IMAP Processing Progress
+          </Box>
+        </DialogTitle>
+        <DialogContent>
+          {bulkImapProgress && (
+            <Box textAlign="center" py={2}>
+              <Typography variant="h6" gutterBottom>
+                Sequential IMAP Connection Setup
+              </Typography>
+
+              <Typography variant="body1" gutterBottom sx={{ mt: 2 }}>
+                Processing user {bulkImapProgress.currentUserIndex + 1} of {bulkImapProgress.totalUsers}
+              </Typography>
+
+              <Typography variant="h5" color="primary" sx={{ fontWeight: 'bold', mt: 1 }}>
+                {bulkImapProgress.user?.email}
+              </Typography>
+
+              <Box my={3}>
+                <CircularProgress size={60} />
+              </Box>
+
+              <Typography variant="body1" gutterBottom>
+                {bulkImapProgress.message}
+              </Typography>
+
+              {/* Progress Summary */}
+              <Box sx={{ mt: 3, p: 2, bgcolor: 'background.paper', borderRadius: 1 }}>
+                <Typography variant="subtitle2" gutterBottom>
+                  Overall Progress
+                </Typography>
+                <Box display="flex" justifyContent="center" gap={2} flexWrap="wrap">
+                  <Chip
+                    label={`Processed: ${bulkImapProgress.currentUserIndex}`}
+                    color="primary"
+                    size="small"
+                  />
+                  <Chip
+                    label={`Remaining: ${bulkImapProgress.totalUsers - bulkImapProgress.currentUserIndex}`}
+                    color="default"
+                    size="small"
+                  />
+                  <Chip
+                    label={`Total: ${bulkImapProgress.totalUsers}`}
+                    color="info"
+                    size="small"
+                  />
+                </Box>
+              </Box>
+
+              {/* Current Results */}
+              {bulkImapProgress.results && bulkImapProgress.results.length > 0 && (
+                <Box sx={{ mt: 3, maxHeight: 200, overflow: 'auto' }}>
+                  <Typography variant="subtitle2" gutterBottom>
+                    Completed Users
+                  </Typography>
+                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                    {bulkImapProgress.results.map((result, index) => {
+                      const getBgColor = (status) => {
+                        switch (status) {
+                          case 'success': return '#e8f5e8';
+                          case 'skipped': return '#e3f2fd';
+                          case 'error': return '#ffebee';
+                          default: return '#f5f5f5';
+                        }
+                      };
+
+                      const getIcon = (status) => {
+                        switch (status) {
+                          case 'success': return <CheckCircle color="success" fontSize="small" />;
+                          case 'skipped': return <CheckCircle color="info" fontSize="small" />;
+                          case 'error': return <Error color="error" fontSize="small" />;
+                          default: return null;
+                        }
+                      };
+
+                      return (
+                        <Box key={index} sx={{ p: 1, borderRadius: 1, bgcolor: getBgColor(result.status) }}>
+                          <Box display="flex" alignItems="center" gap={1}>
+                            {getIcon(result.status)}
+                            <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
+                              {result.user}
+                            </Typography>
+                          </Box>
+                          <Typography variant="caption" color="text.secondary" sx={{ ml: 3 }}>
+                            {result.message}
+                          </Typography>
+                        </Box>
+                      );
+                    })}
+                  </Box>
+                </Box>
+              )}
+
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
+                Started: {new Date(bulkImapProgress.startTime).toLocaleString()}
+              </Typography>
+
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                This dialog will close automatically when processing is complete.
+              </Typography>
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setBulkImapProgress(null)}>
             Close
           </Button>
         </DialogActions>

@@ -72,6 +72,15 @@ export const usersAPI = {
   runManualBackup: (id) => api.post(`/users/${id}/backup`),
   getManualBackupStatus: (id) => api.get(`/users/${id}/backup/status`),
   getUserImapStatus: (id) => api.get(`/users/${id}/imap-status`),
+  getGmailMessageCount: (id) => api.get(`/users/${id}/gmail-message-count`),
+  // Check if user has emails to sync (enhanced smart comparison)
+  checkUserHasEmailsToSync: (id) => api.get(`/users/${id}/check-sync-status`),
+  // Bulk IMAP concurrency control
+  startBulkImap: () => api.post('/users/bulk-imap/start'),
+  endBulkImap: () => api.post('/users/bulk-imap/end'),
+  // Direct bulk IMAP processing (instant execution, bypasses queue service)
+  startDirectBulkImap: (userIds) => api.post('/users/bulk-imap/direct', { userIds }),
+  getBackupStatus: () => api.get('/users/backup/status'),
   getUserStats: (id, params) => api.get(`/users/${id}/stats`, { params }),
   deleteUser: (id) => api.delete(`/users/${id}`),
 };

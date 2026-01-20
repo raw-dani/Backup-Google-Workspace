@@ -560,6 +560,128 @@ router.post('/:id/disconnect', async (req, res) => {
   }
 });
 
+// Get Gmail message count for user
+router.get('/:id/gmail-message-count', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if user exists and is active
+    const users = await query('SELECT * FROM users WHERE id = ? AND status = ?', [id, 'active']);
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'User not found or inactive' });
+    }
+
+    const userEmail = users[0].email;
+
+    // Get IMAP service
+    const { imapService } = require('../services/imap/imapService');
+
+    // Connect to IMAP temporarily to get message count
+    const { imap } = await imapService.connect(userEmail, id);
+
+    try {
+      // Get all folders and count messages in each
+      const folders = await imapService.listFolders(imap);
+      let totalMessages = 0;
+      const folderCounts = [];
+
+      for (const folder of folders) {
+        try {
+          await imapService.openMailbox(imap, folder, true);
+          const mailbox = await imap.mailboxOpen(folder, { readOnly: true });
+
+          if (mailbox && mailbox.exists !== undefined) {
+            folderCounts.push({
+              folder: folder,
+              count: mailbox.exists
+            });
+            totalMessages += mailbox.exists;
+          }
+        } catch (folderError) {
+          logger.warn('Failed to count messages in folder', {
+            userEmail, folder, error: folderError.message
+          });
+          // Continue with other folders
+        }
+      }
+
+      // Disconnect after counting
+      await imapService.disconnect(id);
+
+      logger.info('Gmail message count retrieved', {
+        userId: id, userEmail, totalMessages, folderCount: folderCounts.length
+      });
+
+      res.json({
+        userId: id,
+        userEmail: userEmail,
+        totalMessages: totalMessages,
+        folderCounts: folderCounts,
+        timestamp: new Date().toISOString()
+      });
+
+    } catch (countError) {
+      // Make sure to disconnect even on error
+      try {
+        await imapService.disconnect(id);
+      } catch (disconnectError) {
+        logger.warn('Failed to disconnect after count error', { error: disconnectError.message });
+      }
+      throw countError;
+    }
+
+  } catch (error) {
+    logger.error('Failed to get Gmail message count', {
+      userId: req.params.id,
+      error: error.message
+    });
+    res.status(500).json({ error: 'Failed to get Gmail message count' });
+  }
+});
+
+// Check if user has emails to sync (enhanced smart comparison)
+router.get('/:id/check-sync-status', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if user exists and is active
+    const users = await query('SELECT * FROM users WHERE id = ? AND status = ?', [id, 'active']);
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'User not found or inactive' });
+    }
+
+    const userEmail = users[0].email;
+
+    // Get IMAP service
+    const { imapService } = require('../services/imap/imapService');
+
+    // Use the enhanced sync check function
+    const hasEmailsToSync = await imapService.checkUserHasEmailsToSync(id, userEmail);
+
+    logger.info('Sync status check completed', {
+      userId: id,
+      userEmail,
+      hasEmailsToSync,
+      timestamp: new Date().toISOString()
+    });
+
+    res.json({
+      userId: id,
+      userEmail: userEmail,
+      hasEmailsToSync: hasEmailsToSync,
+      needsSync: hasEmailsToSync,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Failed to check sync status', {
+      userId: req.params.id,
+      error: error.message
+    });
+    res.status(500).json({ error: 'Failed to check sync status' });
+  }
+});
+
 // Get IMAP connection status for user
 router.get('/:id/imap-status', async (req, res) => {
   try {
@@ -722,5 +844,114 @@ async function logAuditAction(adminUserId, action, resource, resourceId, ipAddre
     logger.error('Failed to log audit action', { error: error.message });
   }
 }
+
+// Bulk IMAP operations (for concurrency control)
+router.post('/bulk-imap/start', async (req, res) => {
+  try {
+    const { scheduledBackupService } = require('../services/backup/scheduledBackup');
+    await scheduledBackupService.startBulkImap();
+
+    logger.info('Bulk IMAP operation started via API', { admin: req.user.username });
+    res.json({ message: 'Bulk IMAP operation started successfully' });
+  } catch (error) {
+    logger.error('Failed to start bulk IMAP operation', {
+      error: error.message,
+      admin: req.user.username
+    });
+    res.status(409).json({ error: error.message });
+  }
+});
+
+// Start direct bulk IMAP processing for selected users (bypassing queue service)
+router.post('/bulk-imap/direct', async (req, res) => {
+  try {
+    const { userIds } = req.body;
+
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: 'Invalid user IDs provided' });
+    }
+
+    const { scheduledBackupService } = require('../services/backup/scheduledBackup');
+
+    // Check if bulk IMAP operation is already running
+    const status = scheduledBackupService.getStatus();
+    if (status.bulkImapRunning) {
+      logger.warn('Direct bulk IMAP rejected - bulk operation already running', {
+        admin: req.user.username,
+        userCount: userIds.length
+      });
+      return res.status(409).json({ error: 'Bulk IMAP operation already running' });
+    }
+
+    // Start bulk IMAP operation to set locks
+    await scheduledBackupService.startBulkImap();
+
+    logger.info('Starting direct bulk IMAP processing via API (bypassing queue service)', {
+      admin: req.user.username,
+      userCount: userIds.length,
+      userIds: userIds
+    });
+
+    // Perform direct bulk processing (bypassing queue service)
+    await scheduledBackupService.performDirectBulkImapProcessing(userIds);
+
+    logger.info('Direct bulk IMAP processing completed successfully', {
+      admin: req.user.username,
+      userCount: userIds.length
+    });
+
+    res.json({
+      message: 'Direct bulk IMAP processing completed successfully',
+      userCount: userIds.length
+    });
+  } catch (error) {
+    logger.error('Failed to perform direct bulk IMAP processing', {
+      error: error.message,
+      admin: req.user.username,
+      stack: error.stack?.substring(0, 500)
+    });
+
+    // Try to release locks even on error
+    try {
+      const { scheduledBackupService } = require('../services/backup/scheduledBackup');
+      await scheduledBackupService.endBulkImap();
+    } catch (endError) {
+      logger.error('Failed to release bulk IMAP locks after error', {
+        error: endError.message
+      });
+    }
+
+    res.status(500).json({ error: 'Failed to perform direct bulk IMAP processing' });
+  }
+});
+
+router.post('/bulk-imap/end', async (req, res) => {
+  try {
+    const { scheduledBackupService } = require('../services/backup/scheduledBackup');
+    await scheduledBackupService.endBulkImap();
+
+    logger.info('Bulk IMAP operation ended via API', { admin: req.user.username });
+    res.json({ message: 'Bulk IMAP operation ended successfully' });
+  } catch (error) {
+    logger.error('Failed to end bulk IMAP operation', {
+      error: error.message,
+      admin: req.user.username
+    });
+    res.status(500).json({ error: 'Failed to end bulk IMAP operation' });
+  }
+});
+
+// Get backup status (for concurrency checks)
+router.get('/backup/status', async (req, res) => {
+  try {
+    const { getScheduledBackupStatus } = require('../services/backup/scheduledBackup');
+    const status = getScheduledBackupStatus();
+
+    res.json({ status });
+  } catch (error) {
+    logger.error('Failed to get backup status', { error: error.message });
+    res.status(500).json({ error: 'Failed to get backup status' });
+  }
+});
 
 module.exports = router;

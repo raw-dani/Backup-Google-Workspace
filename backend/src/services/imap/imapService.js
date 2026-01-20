@@ -258,6 +258,63 @@ class ImapService {
     }
   }
 
+  // ENHANCED: Check if user has emails to sync with smart comparison
+  async checkUserHasEmailsToSync(userId, userEmail) {
+    try {
+      // Get current DB count
+      const dbStats = await query('SELECT COUNT(*) as dbCount FROM emails WHERE user_id = ?', [userId]);
+      const dbCount = dbStats[0]?.dbCount || 0;
+
+      // Get Gmail count by connecting temporarily
+      const { imap } = await this.connect(userEmail, userId);
+      let gmailCount = 0;
+
+      try {
+        // Get all folders and count messages in each
+        const folders = await this.listFolders(imap);
+        for (const folder of folders) {
+          try {
+            await this.openMailbox(imap, folder, true);
+            const mailbox = await imap.mailboxOpen(folder, { readOnly: true });
+            if (mailbox && mailbox.exists !== undefined) {
+              gmailCount += mailbox.exists;
+            }
+          } catch (folderError) {
+            logger.warn('Failed to count messages in folder', {
+              userEmail, folder, error: folderError.message
+            });
+            // Continue with other folders
+          }
+        }
+      } finally {
+        // Always disconnect after counting
+        await this.disconnect(userId);
+      }
+
+      // If counts match, no need to sync
+      if (dbCount === gmailCount) {
+        logger.info(`✅ ${userEmail}: DB (${dbCount}) matches Gmail (${gmailCount}) - no sync needed`);
+        return false;
+      }
+
+      // If DB has more than Gmail (shouldn't happen), force full sync
+      if (dbCount > gmailCount) {
+        logger.warn(`⚠️ ${userEmail}: DB (${dbCount}) > Gmail (${gmailCount}) - forcing full sync`);
+        return true;
+      }
+
+      // Calculate difference
+      const emailsToSync = gmailCount - dbCount;
+      logger.info(`📥 ${userEmail}: ${emailsToSync} new emails to sync (DB: ${dbCount}, Gmail: ${gmailCount})`);
+      return emailsToSync > 0;
+
+    } catch (error) {
+      logger.error(`❌ Error checking sync status for ${userEmail}:`, error);
+      // If we can't determine, assume we need to sync
+      return true;
+    }
+  }
+
   // OPTIMASI: Clear Message-ID cache untuk user tertentu
   clearMessageIdCache(userId = null) {
     if (userId) {

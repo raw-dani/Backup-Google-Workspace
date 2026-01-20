@@ -19,6 +19,8 @@ class ScheduledBackupService {
   constructor() {
     this.isRunning = false;
     this.manualBackupRunning = false; // Flag to prevent concurrent manual backups
+    this.bulkImapRunning = false; // Flag to prevent concurrent bulk IMAP operations
+    this.backupLock = false; // Additional lock to prevent any backup during bulk operations
     this.cronJob = null;
     // Always use real Gmail mode - no development mode
     this.backupInterval = process.env.BACKUP_INTERVAL || '60'; // Default 60 minutes
@@ -46,12 +48,8 @@ class ScheduledBackupService {
     }
 
     this.cronJob = cron.schedule(cronExpression, async () => {
-      // Double-check both scheduled and manual backup flags
-      if (this.isRunning || this.manualBackupRunning) {
-        logger.warn('Backup already running (scheduled or manual), skipping scheduled backup', {
-          isRunning: this.isRunning,
-          manualBackupRunning: this.manualBackupRunning
-        });
+      // Use enhanced check that gives bulk operations absolute priority
+      if (!this.shouldRunScheduledBackup()) {
         return;
       }
 
@@ -284,10 +282,171 @@ class ScheduledBackupService {
     }
   }
 
+  // Check if any backup operation is currently running
+  isAnyBackupRunning() {
+    return this.isRunning || this.manualBackupRunning || this.bulkImapRunning || this.backupLock;
+  }
+
+  // Start bulk IMAP operation (called from frontend bulk IMAP)
+  async startBulkImap() {
+    if (this.isAnyBackupRunning()) {
+      const errorMsg = 'Cannot start bulk IMAP: Another backup operation is currently running';
+      logger.warn('Bulk IMAP rejected - backup already running', {
+        isRunning: this.isRunning,
+        manualBackupRunning: this.manualBackupRunning,
+        bulkImapRunning: this.bulkImapRunning,
+        backupLock: this.backupLock
+      });
+      throw new Error(errorMsg);
+    }
+
+    this.bulkImapRunning = true;
+    this.backupLock = true; // Set global backup lock
+    logger.info('Bulk IMAP operation started with global lock - BLOCKING all scheduled backups');
+
+    // Return immediately to allow frontend to start processing without delay
+    // The frontend's pollBulkImapStatus function will handle the actual user processing
+    // This ensures bulk operations run immediately and bypass the queue service entirely
+  }
+
+  // Enhanced scheduled backup check that respects bulk operations
+  shouldRunScheduledBackup() {
+    // Bulk IMAP operations have absolute priority - never interrupt them
+    if (this.bulkImapRunning || this.backupLock) {
+      logger.info('Scheduled backup skipped - bulk IMAP operation has priority', {
+        bulkImapRunning: this.bulkImapRunning,
+        backupLock: this.backupLock
+      });
+      return false;
+    }
+
+    // Also check for manual backups
+    if (this.manualBackupRunning) {
+      logger.info('Scheduled backup skipped - manual backup in progress');
+      return false;
+    }
+
+    // Check if scheduled backup is already running (shouldn't happen but just in case)
+    if (this.isRunning) {
+      logger.warn('Scheduled backup skipped - already running');
+      return false;
+    }
+
+    return true;
+  }
+
+  // Perform direct bulk IMAP processing for selected users (bypassing queue service)
+  async performDirectBulkImapProcessing(userIds) {
+    try {
+      // SPECIFIC BULK LOG: Clear indication that bulk operation is starting
+      logger.info('🚀 [BULK IMAP START] Instant bulk IMAP processing initiated (bypassing queue service)', {
+        operation: 'BULK_IMAP_DIRECT',
+        userCount: userIds.length,
+        userIds: userIds,
+        timestamp: new Date().toISOString()
+      });
+
+      // Get user emails for processing
+      const { query } = require('../database/databaseService');
+      const users = await query(
+        'SELECT id, email FROM users WHERE id IN (?) AND status = ?',
+        [userIds, 'active']
+      );
+
+      // SPECIFIC BULK LOG: Show which users will be processed
+      logger.info('📋 [BULK IMAP USERS] Found active users for instant bulk processing', {
+        operation: 'BULK_IMAP_DIRECT',
+        count: users.length,
+        users: users.map(u => u.email),
+        timestamp: new Date().toISOString()
+      });
+
+      if (users.length === 0) {
+        logger.info('⚠️ [BULK IMAP SKIPPED] No active users found for bulk IMAP processing', {
+          operation: 'BULK_IMAP_DIRECT',
+          timestamp: new Date().toISOString()
+        });
+        return;
+      }
+
+      // Process users sequentially to avoid overwhelming Gmail
+      for (const user of users) {
+        try {
+          // SPECIFIC BULK LOG: Clear indication of bulk user processing
+          logger.info(`🔄 [BULK IMAP USER START] Processing user in bulk operation: ${user.email}`, {
+            operation: 'BULK_IMAP_DIRECT',
+            userId: user.id,
+            email: user.email,
+            timestamp: new Date().toISOString()
+          });
+
+          // Use direct connection method (same as individual "Start IMAP Connection" button)
+          const { imapService } = require('../imap/imapService');
+          await imapService.connect(user.email, user.id);
+
+          // SPECIFIC BULK LOG: Success for individual user in bulk operation
+          logger.info(`✅ [BULK IMAP USER SUCCESS] Completed processing user: ${user.email}`, {
+            operation: 'BULK_IMAP_DIRECT',
+            userId: user.id,
+            email: user.email,
+            timestamp: new Date().toISOString()
+          });
+
+          // Add small delay between users for stability
+          const delayBetweenUsers = 2000; // 2 seconds
+          logger.info(`⏳ [BULK IMAP DELAY] Waiting ${delayBetweenUsers/1000} seconds before next user`, {
+            operation: 'BULK_IMAP_DIRECT',
+            currentUser: user.email,
+            nextDelaySeconds: delayBetweenUsers/1000,
+            timestamp: new Date().toISOString()
+          });
+          await new Promise(resolve => setTimeout(resolve, delayBetweenUsers));
+
+        } catch (error) {
+          // SPECIFIC BULK LOG: Error for individual user in bulk operation
+          logger.error(`❌ [BULK IMAP USER ERROR] Failed to process user: ${user.email}`, {
+            operation: 'BULK_IMAP_DIRECT',
+            userId: user.id,
+            email: user.email,
+            error: error.message,
+            timestamp: new Date().toISOString()
+          });
+          // Continue with next user even if one fails
+        }
+      }
+
+      // SPECIFIC BULK LOG: Clear indication that bulk operation completed
+      logger.info('🎉 [BULK IMAP COMPLETED] Instant bulk IMAP processing finished successfully', {
+        operation: 'BULK_IMAP_DIRECT',
+        userCount: users.length,
+        timestamp: new Date().toISOString()
+      });
+
+    } catch (error) {
+      // SPECIFIC BULK LOG: Error for entire bulk operation
+      logger.error('💥 [BULK IMAP FAILED] Instant bulk IMAP processing failed', {
+        operation: 'BULK_IMAP_DIRECT',
+        error: error.message,
+        stack: error.stack?.substring(0, 500),
+        timestamp: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+
+  // End bulk IMAP operation
+  async endBulkImap() {
+    this.bulkImapRunning = false;
+    this.backupLock = false; // Release global backup lock
+    logger.info('Bulk IMAP operation ended, global lock released');
+  }
+
   getStatus() {
     return {
       isRunning: this.isRunning,
       manualBackupRunning: this.manualBackupRunning,
+      bulkImapRunning: this.bulkImapRunning,
+      anyBackupRunning: this.isAnyBackupRunning(),
       nextRun: this.cronJob ? this.cronJob.nextRun : null,
     };
   }
