@@ -900,6 +900,9 @@ router.post('/bulk-imap/direct', async (req, res) => {
       userCount: userIds.length
     });
 
+    // Release bulk IMAP locks
+    await scheduledBackupService.endBulkImap();
+
     res.json({
       message: 'Direct bulk IMAP processing completed successfully',
       userCount: userIds.length
@@ -938,6 +941,23 @@ router.post('/bulk-imap/end', async (req, res) => {
       admin: req.user.username
     });
     res.status(500).json({ error: 'Failed to end bulk IMAP operation' });
+  }
+});
+
+// Stop manual backup operation
+router.post('/backup/stop', async (req, res) => {
+  try {
+    const { scheduledBackupService } = require('../services/backup/scheduledBackup');
+    await scheduledBackupService.stopManualBackup();
+
+    logger.info('Manual backup operation stopped via API', { admin: req.user.username });
+    res.json({ message: 'Manual backup operation stopped successfully' });
+  } catch (error) {
+    logger.error('Failed to stop manual backup operation', {
+      error: error.message,
+      admin: req.user.username
+    });
+    res.status(500).json({ error: 'Failed to stop manual backup operation' });
   }
 });
 

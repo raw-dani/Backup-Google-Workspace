@@ -1740,8 +1740,6 @@ class ImapService {
     }
   }
 
-
-
   async backupFolder(imap, folder, userId, userEmail) {
     try {
       logger.info('Backing up folder', { userEmail, folder });

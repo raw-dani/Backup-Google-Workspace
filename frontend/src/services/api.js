@@ -81,6 +81,8 @@ export const usersAPI = {
   // Direct bulk IMAP processing (instant execution, bypasses queue service)
   startDirectBulkImap: (userIds) => api.post('/users/bulk-imap/direct', { userIds }),
   getBackupStatus: () => api.get('/users/backup/status'),
+  // Manual backup operations
+  stopManualBackup: () => api.post('/users/backup/stop'),
   getUserStats: (id, params) => api.get(`/users/${id}/stats`, { params }),
   deleteUser: (id) => api.delete(`/users/${id}`),
 };

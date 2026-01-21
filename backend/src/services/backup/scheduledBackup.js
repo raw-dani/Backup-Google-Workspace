@@ -339,8 +339,8 @@ class ScheduledBackupService {
   async performDirectBulkImapProcessing(userIds) {
     try {
       // SPECIFIC BULK LOG: Clear indication that bulk operation is starting
-      logger.info('🚀 [BULK IMAP START] Instant bulk IMAP processing initiated (bypassing queue service)', {
-        operation: 'BULK_IMAP_DIRECT',
+      logger.info('🚀 [BULK BACKUP START] Instant bulk backup processing initiated (bypassing queue service)', {
+        operation: 'BULK_BACKUP_DIRECT',
         userCount: userIds.length,
         userIds: userIds,
         timestamp: new Date().toISOString()
@@ -354,16 +354,16 @@ class ScheduledBackupService {
       );
 
       // SPECIFIC BULK LOG: Show which users will be processed
-      logger.info('📋 [BULK IMAP USERS] Found active users for instant bulk processing', {
-        operation: 'BULK_IMAP_DIRECT',
+      logger.info('📋 [BULK BACKUP USERS] Found active users for instant bulk processing', {
+        operation: 'BULK_BACKUP_DIRECT',
         count: users.length,
         users: users.map(u => u.email),
         timestamp: new Date().toISOString()
       });
 
       if (users.length === 0) {
-        logger.info('⚠️ [BULK IMAP SKIPPED] No active users found for bulk IMAP processing', {
-          operation: 'BULK_IMAP_DIRECT',
+        logger.info('⚠️ [BULK BACKUP SKIPPED] No active users found for bulk backup processing', {
+          operation: 'BULK_BACKUP_DIRECT',
           timestamp: new Date().toISOString()
         });
         return;
@@ -373,29 +373,38 @@ class ScheduledBackupService {
       for (const user of users) {
         try {
           // SPECIFIC BULK LOG: Clear indication of bulk user processing
-          logger.info(`🔄 [BULK IMAP USER START] Processing user in bulk operation: ${user.email}`, {
-            operation: 'BULK_IMAP_DIRECT',
+          logger.info(`🔄 [BULK BACKUP USER START] Processing user in bulk operation: ${user.email}`, {
+            operation: 'BULK_BACKUP_DIRECT',
             userId: user.id,
             email: user.email,
             timestamp: new Date().toISOString()
           });
 
-          // Use direct connection method (same as individual "Start IMAP Connection" button)
-          const { imapService } = require('../imap/imapService');
-          await imapService.connect(user.email, user.id);
+          // Clean up stale connections for specific user
+          const isHealthy = await imapService.isConnectionHealthy(user.id);
+          if (!isHealthy && imapService.connections.has(user.id)) {
+            logger.warn('Existing connection unhealthy, forcing disconnect before bulk backup', { 
+              userId: user.id, 
+              email: user.email 
+            });
+            await imapService.forceDisconnect(user.id);
+          }
+
+          // Perform actual backup for the user
+          await this.backupUserMailbox(user.id, user.email);
 
           // SPECIFIC BULK LOG: Success for individual user in bulk operation
-          logger.info(`✅ [BULK IMAP USER SUCCESS] Completed processing user: ${user.email}`, {
-            operation: 'BULK_IMAP_DIRECT',
+          logger.info(`✅ [BULK BACKUP USER SUCCESS] Completed processing user: ${user.email}`, {
+            operation: 'BULK_BACKUP_DIRECT',
             userId: user.id,
             email: user.email,
             timestamp: new Date().toISOString()
           });
 
-          // Add small delay between users for stability
-          const delayBetweenUsers = 2000; // 2 seconds
-          logger.info(`⏳ [BULK IMAP DELAY] Waiting ${delayBetweenUsers/1000} seconds before next user`, {
-            operation: 'BULK_IMAP_DIRECT',
+          // Add delay between users to ensure complete cleanup and avoid rate limiting
+          const delayBetweenUsers = 10000; // 10 seconds for better Gmail stability
+          logger.info(`⏳ [BULK BACKUP DELAY] Waiting ${delayBetweenUsers/1000} seconds before next user`, {
+            operation: 'BULK_BACKUP_DIRECT',
             currentUser: user.email,
             nextDelaySeconds: delayBetweenUsers/1000,
             timestamp: new Date().toISOString()
@@ -404,8 +413,8 @@ class ScheduledBackupService {
 
         } catch (error) {
           // SPECIFIC BULK LOG: Error for individual user in bulk operation
-          logger.error(`❌ [BULK IMAP USER ERROR] Failed to process user: ${user.email}`, {
-            operation: 'BULK_IMAP_DIRECT',
+          logger.error(`❌ [BULK BACKUP USER ERROR] Failed to process user: ${user.email}`, {
+            operation: 'BULK_BACKUP_DIRECT',
             userId: user.id,
             email: user.email,
             error: error.message,
@@ -416,16 +425,16 @@ class ScheduledBackupService {
       }
 
       // SPECIFIC BULK LOG: Clear indication that bulk operation completed
-      logger.info('🎉 [BULK IMAP COMPLETED] Instant bulk IMAP processing finished successfully', {
-        operation: 'BULK_IMAP_DIRECT',
+      logger.info('🎉 [BULK BACKUP COMPLETED] Instant bulk backup processing finished successfully', {
+        operation: 'BULK_BACKUP_DIRECT',
         userCount: users.length,
         timestamp: new Date().toISOString()
       });
 
     } catch (error) {
       // SPECIFIC BULK LOG: Error for entire bulk operation
-      logger.error('💥 [BULK IMAP FAILED] Instant bulk IMAP processing failed', {
-        operation: 'BULK_IMAP_DIRECT',
+      logger.error('💥 [BULK BACKUP FAILED] Instant bulk backup processing failed', {
+        operation: 'BULK_BACKUP_DIRECT',
         error: error.message,
         stack: error.stack?.substring(0, 500),
         timestamp: new Date().toISOString()
@@ -439,6 +448,12 @@ class ScheduledBackupService {
     this.bulkImapRunning = false;
     this.backupLock = false; // Release global backup lock
     logger.info('Bulk IMAP operation ended, global lock released');
+  }
+
+  // Stop manual backup operation
+  async stopManualBackup() {
+    this.manualBackupRunning = false;
+    logger.info('Manual backup operation stopped');
   }
 
   getStatus() {
@@ -477,4 +492,5 @@ module.exports = {
   stopScheduledBackup,
   getScheduledBackupStatus,
   runManualBackup,
+  stopManualBackup: scheduledBackupService.stopManualBackup.bind(scheduledBackupService),
 };
