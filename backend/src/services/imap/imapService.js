@@ -985,6 +985,7 @@ class ImapService {
       const fullMessages = await this.fetchMessages(imap, uid.toString(), {
         source: true,
         internalDate: true,
+        size: true // Get size info to check before downloading full content
       });
 
       if (!fullMessages || !fullMessages[0].sourceBuffer) {
@@ -995,8 +996,20 @@ class ImapService {
       const rawContent = fullMessages[0].sourceBuffer;
 
       // Monitor RAM saat memproses file besar
-      if (rawContent.length > 10 * 1024 * 1024) {
-        logger.info(`Handling Large Email (${(rawContent.length/1024/1024).toFixed(2)} MB)`, { uid });
+      const emailSizeMB = rawContent.length / (1024 * 1024);
+      if (emailSizeMB > 10) {
+        logger.warn(`Handling Very Large Email (${emailSizeMB.toFixed(2)} MB)`, {
+          uid, userEmail, folder, sizeBytes: rawContent.length
+        });
+
+        // For extremely large emails (>50MB), skip processing to prevent OOM
+        if (emailSizeMB > 50) {
+          logger.error(`Skipping Extremely Large Email (${emailSizeMB.toFixed(2)} MB) to prevent OOM`, {
+            uid, userEmail, folder, sizeBytes: rawContent.length
+          });
+          await this.updateLastUidByFolder(userId, folder, uid);
+          return null;
+        }
       }
 
       // Parsing menggunakan simpleParser
@@ -1849,16 +1862,23 @@ class ImapService {
       let successCount = 0;
       let errorCount = 0;
 
-      // OPTIMASI MEMORY: Adjust batch size based on mailbox size untuk mencegah OOM
+  // OPTIMASI MEMORY: Adjust batch size based on mailbox size untuk mencegah OOM
       const totalMessages = uids.length;
       let batchSize;
 
-      if (totalMessages > 10000) {
-        batchSize = 25; // Smaller batch untuk mailbox sangat besar
-        logger.info('Using smaller batch size for large mailbox', { userEmail, folder, totalMessages, batchSize });
+      // More aggressive batch size reduction for memory safety
+      if (totalMessages > 50000) {
+        batchSize = 10; // Very small batch for extremely large mailboxes
+        logger.info('Using very small batch size for extremely large mailbox', { userEmail, folder, totalMessages, batchSize });
+      } else if (totalMessages > 20000) {
+        batchSize = 15; // Small batch untuk mailbox sangat besar
+        logger.info('Using small batch size for very large mailbox', { userEmail, folder, totalMessages, batchSize });
+      } else if (totalMessages > 10000) {
+        batchSize = 20; // Medium-small batch untuk mailbox besar
+        logger.info('Using medium-small batch size for large mailbox', { userEmail, folder, totalMessages, batchSize });
       } else if (totalMessages > 5000) {
-        batchSize = 30; // Medium batch untuk mailbox besar
-        logger.info('Using medium batch size for large mailbox', { userEmail, folder, totalMessages, batchSize });
+        batchSize = 30; // Medium batch untuk mailbox sedang
+        logger.info('Using medium batch size for medium mailbox', { userEmail, folder, totalMessages, batchSize });
       } else {
         batchSize = 50; // Normal batch untuk mailbox kecil
       }
@@ -1868,6 +1888,10 @@ class ImapService {
         logger.info('Running manual garbage collection before large batch processing', { userEmail, folder, totalMessages });
         global.gc();
       }
+
+      // MEMORY MONITORING: Track memory usage during processing
+      let lastMemoryCheck = Date.now();
+      let memoryCheckInterval = 10; // Check every 10 batches
 
       for (let batchIndex = 0; batchIndex < uids.length; batchIndex += batchSize) {
         const batch = uids.slice(batchIndex, batchIndex + batchSize);
@@ -1964,6 +1988,55 @@ class ImapService {
             });
             await new Promise(resolve => setTimeout(resolve, delayMs));
           }
+        }
+
+        // MEMORY MONITORING: Check memory usage every N batches and cleanup if needed
+        const currentBatchNumber = Math.floor(batchIndex / batchSize) + 1;
+        if (currentBatchNumber % memoryCheckInterval === 0 || currentBatchNumber === Math.ceil(uids.length / batchSize)) {
+          const memStats = this.getMemoryStats();
+          const now = Date.now();
+          const timeSinceLastCheck = now - lastMemoryCheck;
+
+          logger.info('Memory check during batch processing', {
+            userEmail,
+            folder,
+            batchNumber: currentBatchNumber,
+            totalBatches: Math.ceil(uids.length / batchSize),
+            heapUsedMB: memStats.heapUsed,
+            heapTotalMB: memStats.heapTotal,
+            cacheSize: memStats.cacheSize,
+            cacheMemoryMB: memStats.cacheMemoryEstimate,
+            timeSinceLastCheckMs: timeSinceLastCheck,
+            processedMessages: processedCount,
+            totalMessages: uids.length
+          });
+
+          // Force garbage collection if memory usage is high
+          if (memStats.heapUsed > 400) { // > 400MB heap usage
+            logger.warn('High memory usage detected, forcing garbage collection', {
+              userEmail,
+              folder,
+              heapUsedMB: memStats.heapUsed,
+              processedMessages: processedCount
+            });
+
+            if (global.gc) {
+              global.gc();
+              const afterGc = this.getMemoryStats();
+              logger.info('Garbage collection completed', {
+                beforeHeapMB: memStats.heapUsed,
+                afterHeapMB: afterGc.heapUsed,
+                freedMB: memStats.heapUsed - afterGc.heapUsed
+              });
+            }
+          }
+
+          // Clear expired Message-ID caches periodically to free memory
+          if (currentBatchNumber % (memoryCheckInterval * 3) === 0) {
+            await this.performMemoryCleanup(true); // Force cleanup
+          }
+
+          lastMemoryCheck = now;
         }
 
         // Log progress after each batch

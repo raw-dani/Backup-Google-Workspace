@@ -5,7 +5,9 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "start:highmem": "node --max-old-space-size=4096 src/index.js",
     "dev": "nodemon src/index.js",
+    "dev:highmem": "nodemon --max-old-space-size=4096 src/index.js",
     "dev:windows": "set NODE_ENV=development&& nodemon src/index.js",
     "test": "jest",
     "setup:windows": "npm run setup:db && npm run setup:redis",

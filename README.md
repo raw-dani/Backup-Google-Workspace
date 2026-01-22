@@ -178,6 +178,40 @@ start-dev.bat
 start-prod.bat
 ```
 
+## Memory Optimization
+
+For large mailbox backups, use the high-memory scripts to prevent heap out of memory errors:
+
+### High Memory Mode (Recommended for Production)
+
+```bash
+# Backend with 4GB memory limit
+cd backend
+npm run start:highmem
+
+# Or for development
+npm run dev:highmem
+```
+
+### Standard Mode
+
+```bash
+# Backend with default memory (may cause OOM on large mailboxes)
+cd backend
+npm run start
+
+# Or for development
+npm run dev
+```
+
+### Memory Optimization Features
+
+- **Automatic batch size adjustment** based on mailbox size
+- **Memory monitoring** with periodic cleanup
+- **Large email filtering** (>50MB emails are skipped)
+- **Garbage collection** triggered when heap usage > 400MB
+- **Cache expiration** to prevent memory leaks
+
 ### Windows Service (NSSM)
 
 ```batch
