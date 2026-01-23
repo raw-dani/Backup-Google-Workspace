@@ -226,11 +226,14 @@ function Domains() {
 
   return (
     <Box>
-      <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
-        <Typography variant="h4" component="h1">
+      <Box mb={3}>
+        <Typography variant="h4" component="h1" gutterBottom>
           Domains Management
         </Typography>
-        <Box>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          Add multiple domains to backup users from different Google Workspace organizations
+        </Typography>
+        <Box display="flex" justifyContent="space-between" alignItems="center">
           <Button
             variant="outlined"
             startIcon={<Refresh />}
